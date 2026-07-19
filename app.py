@@ -62,7 +62,7 @@ REMINDER_MESSAGE = (
 
 # Number(s) to notify when a reading is out of range (e.g. your own number)
 ADMIN_NUMBERS = [
-    "whatsapp:+91XXXXXXXXXX",  # replace with your number
+    "whatsapp:+919402168373",  # replace with your number
 ]
 
 # Google Sheets config
