@@ -42,8 +42,9 @@ TWILIO_WHATSAPP_NUMBER = os.environ.get("TWILIO_WHATSAPP_NUMBER", "whatsapp:+141
 
 # Add each operator here: name + their WhatsApp number (must have joined the sandbox)
 OPERATORS = [
-    {"name": "Operator1", "number": "whatsapp:+91XXXXXXXXXX"},
-    # {"name": "Operator2", "number": "whatsapp:+91XXXXXXXXXX"},
+    {"name": "Vikas", "number": "whatsapp:+919402168373"},
+    {"name": "Prakash", "number": "whatsapp:+919829945873"},
+    {"name": "Subodh", "number": "whatsapp:+918302822703"},
 ]
 
 REMINDER_TIMES = ["08:00", "20:00"]   # 24-hour format, sends exactly at these times daily
