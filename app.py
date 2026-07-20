@@ -61,6 +61,7 @@ TEMP_RANGES = {
 # ---- PRODUCTION & ELECTRICITY reminder (new) ----
 PRODUCTION_OPERATORS = [
     {"name": "Rana", "number": "whatsapp:+919667807024"},
+    {"name": "Vikas", "number": "whatsapp:+919402168373"},
 ]
 PRODUCTION_REMINDER_TIMES = ["10:00"]
 PRODUCTION_FIELDS = ["E1", "P1"]
