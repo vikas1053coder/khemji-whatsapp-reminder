@@ -1,5 +1,0 @@
-flask
-twilio
-apscheduler
-gspread
-google-auth
