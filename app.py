@@ -2428,8 +2428,6 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     qtyInput.type = 'number'; qtyInput.name = 'wr_qty[]'; qtyInput.placeholder = 'Qty (Kg)'; qtyInput.step = 'any';
 
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
-    catSelect.addEventListener('change', fillItems);
-    fillItems();
 
     row.appendChild(select); row.appendChild(customInput); row.appendChild(qtyInput);
     container.appendChild(row);
@@ -3426,15 +3424,15 @@ SALES_FORM_HTML = BASE_STYLE + """
 
     var catLabel = document.createElement('label'); catLabel.textContent = 'Category';
     var catSelect = document.createElement('select');
-    Object.keys(saleCategories).forEach(function(c) {
-      var o = document.createElement('option'); o.value = c; o.textContent = c; catSelect.appendChild(o);
+    saleCategories.forEach(function(pair) {
+      var o = document.createElement('option'); o.value = pair[0]; o.textContent = pair[0]; catSelect.appendChild(o);
     });
 
     var select = document.createElement('select');
     select.name = 'item[]';
     function fillItems() {
       select.innerHTML = '';
-      (saleCategories[catSelect.value] || []).forEach(function(it) {
+      (saleCategories.filter(function(p) { return p[0] === catSelect.value; })[0] || [0, []])[1].forEach(function(it) {
         var opt = document.createElement('option'); opt.value = it; opt.textContent = it; select.appendChild(opt);
       });
       var otherOpt = document.createElement('option'); otherOpt.value = 'Other'; otherOpt.textContent = 'Other';
@@ -3446,6 +3444,8 @@ SALES_FORM_HTML = BASE_STYLE + """
     customInput.type = 'text'; customInput.name = 'custom_item[]'; customInput.placeholder = 'Specify item';
     customInput.style.display = 'none'; customInput.style.marginTop = '8px';
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
+    catSelect.addEventListener('change', fillItems);
+    fillItems();
 
     var qtyLabel = document.createElement('label'); qtyLabel.textContent = 'Quantity Sold';
     var qtyInput = document.createElement('input');
@@ -3476,12 +3476,12 @@ SALES_FORM_HTML = BASE_STYLE + """
 @app.route("/sales-form", methods=["GET"])
 def sales_form():
     operator = request.args.get("operator", "Operator")
-    sale_categories = {
-        "Finished Goods": get_dropdown_items("Finished Goods"),
-        "Semi-Finished (MS Wire / Scrap)": get_dropdown_items("Semi-Finished"),
-        "Raw Material (Wire Rod)": get_dropdown_items("Raw Material"),
-        "Consumables": get_dropdown_items("Consumables"),
-    }
+    sale_categories = [
+        ["Finished Goods", get_dropdown_items("Finished Goods")],
+        ["Semi-Finished (MS Wire / Scrap)", get_dropdown_items("Semi-Finished")],
+        ["Raw Material (Wire Rod)", get_dropdown_items("Raw Material")],
+        ["Consumables", get_dropdown_items("Consumables")],
+    ]
     return render_template_string(SALES_FORM_HTML, operator=operator, default_time=default_entry_time(),
                                    sale_categories=sale_categories)
 
