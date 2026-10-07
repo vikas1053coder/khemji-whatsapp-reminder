@@ -647,6 +647,7 @@ def get_all_known_items():
     finished |= set(r[0] for r in cur.fetchall())
     finished -= semi_finished  # a semi-finished item sold directly shouldn't also count as finished goods
     finished -= raw_material   # a raw material item (e.g. Wire Rod) sold directly shouldn't count as finished goods either
+    finished -= consumables    # a consumable (e.g. Zinc, Lead) sold directly shouldn't count as finished goods either
 
     cur.close()
     return {
@@ -975,7 +976,7 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
     data behind the Item Detail drill-down page. Quantities only, no rates -
     safe to show to operators too, same as the stock tables themselves."""
     category_map = {
-        "Consumables": [("receipt_consumables", "Received"), ("consumption", "Consumed")],
+        "Consumables": [("receipt_consumables", "Received"), ("consumption", "Consumed"), ("sale", "Sold")],
         "Raw Material": [("receipt_raw_material", "Received"), ("wire_rod", "Issued"), ("sale", "Sold")],
         "Semi-Finished": [("ms_wire_produced", "Produced"), ("scrap_produced", "Produced"),
                           ("receipt_semi_finished", "Received"), ("ms_wire_consumed", "Issued"), ("sale", "Sold")],
@@ -1292,13 +1293,34 @@ def compute_pnl(month_str, manual_opening_fg_value=None):
     _, ms_wire_revenue = sum_sales_qty_and_revenue_for_month("MS Wire", month_str)
     _, scrap_revenue = sum_sales_qty_and_revenue_for_month("Scrap", month_str)
     wire_rod_revenue = category_sales_revenue("Raw Material")
-    total_revenue = round(fg_revenue + ms_wire_revenue + scrap_revenue + wire_rod_revenue, 2)
+
+    # --- Consumables Sold Directly (Zinc, Lead, etc.): costed at the latest
+    #     receipt rate as of month-end. Consumption entries are separate from
+    #     sales, so this never touches Cost of Production - it only adds its
+    #     own revenue line and its own cost line against Gross Profit. ---
+    consumables_sold_qty, consumables_sold_revenue, consumables_sold_cost = 0.0, 0.0, 0.0
+    consumables_sold_breakdown = []
+    for item in sorted(set(SEED_ITEMS.get("Consumables", [])) | set(known_items.get("Consumables", []))):
+        q, r = sum_sales_qty_and_revenue_for_month(item, month_str)
+        if q:
+            rate = get_rate_as_of_date(item, last_day) or 0.0
+            cost = round(q * rate, 2)
+            consumables_sold_breakdown.append({"item": item, "qty": round(q, 2), "revenue": round(r, 2),
+                                               "cost_rate": rate, "cost": cost, "profit": round(r - cost, 2)})
+            consumables_sold_qty += q
+            consumables_sold_revenue += r
+            consumables_sold_cost += cost
+    consumables_sold_revenue = round(consumables_sold_revenue, 2)
+    consumables_sold_cost = round(consumables_sold_cost, 2)
+    consumables_sold_profit = round(consumables_sold_revenue - consumables_sold_cost, 2)
+
+    total_revenue = round(fg_revenue + ms_wire_revenue + scrap_revenue + wire_rod_revenue + consumables_sold_revenue, 2)
 
     # MS Wire Sold Cost and Wire Rod Sold Cost were both deliberately carved out
     # above (so neither inflates Finished Goods' Cost of Production) - they still
     # need to be subtracted here, directly against their own revenue, or Gross
     # Profit would be overstated by exactly those amounts.
-    gross_profit = round(total_revenue - cogs - ms_wire_sold_cost - wire_rod_sold_cost, 2)
+    gross_profit = round(total_revenue - cogs - ms_wire_sold_cost - wire_rod_sold_cost - consumables_sold_cost, 2)
 
     # --- Conversion Cost per Kg (everything except raw material itself) ---
     conversion_cost_total = round(consumables_value + electricity_cost + salary + interest + logistics + director_remuneration + other_costs + maintenance_cost, 2)
@@ -1339,6 +1361,9 @@ def compute_pnl(month_str, manual_opening_fg_value=None):
         "cogs": cogs,
         "fg_revenue": fg_revenue, "ms_wire_revenue": ms_wire_revenue, "scrap_revenue": scrap_revenue,
         "wire_rod_revenue": wire_rod_revenue, "total_revenue": total_revenue,
+        "consumables_sold_qty": round(consumables_sold_qty, 2), "consumables_sold_revenue": consumables_sold_revenue,
+        "consumables_sold_cost": consumables_sold_cost, "consumables_sold_profit": consumables_sold_profit,
+        "consumables_sold_breakdown": consumables_sold_breakdown,
         "gross_profit": gross_profit,
         "conversion_cost_per_kg": conversion_cost_per_kg,
         "scale_loss_kg": scale_loss_kg, "scale_loss_value": scale_loss_value,
@@ -1481,7 +1506,9 @@ def sum_qty_by_item_for_date(category_db_value, date_str):
 
 def compute_in_out_for_date(category_label, item_name, date_str):
     if category_label == "Consumables":
-        return sum_qty_for_date("receipt_consumables", item_name, date_str), sum_qty_for_date("consumption", item_name, date_str)
+        sales_map, _, _ = get_sales_summary_for_date(date_str)
+        return (sum_qty_for_date("receipt_consumables", item_name, date_str),
+                sum_qty_for_date("consumption", item_name, date_str) + sales_map.get(item_name, 0.0))
     elif category_label == "Raw Material":
         sales_map, _, _ = get_sales_summary_for_date(date_str)
         out_amt = sum_qty_for_date("wire_rod", item_name, date_str) + sales_map.get(item_name, 0.0)
@@ -1534,8 +1561,10 @@ def compute_stock(selected_date=None):
         # Fetch this category's In/Out maps ONCE (covers every item), instead of
         # one query per item - this is the main fix for slow dashboard loads.
         if category_label == "Consumables":
+            sales_map, _, _ = get_sales_summary_for_date(date_str)
             in_map = sum_qty_by_item_for_date("receipt_consumables", date_str)
-            out_map = sum_qty_by_item_for_date("consumption", date_str)
+            consumed_map = sum_qty_by_item_for_date("consumption", date_str)
+            out_map = {i: consumed_map.get(i, 0.0) + sales_map.get(i, 0.0) for i in items}
         elif category_label == "Raw Material":
             sales_map, _, _ = get_sales_summary_for_date(date_str)
             in_map = sum_qty_by_item_for_date("receipt_raw_material", date_str)
@@ -3434,7 +3463,8 @@ SALES_FORM_HTML = BASE_STYLE + """
 @app.route("/sales-form", methods=["GET"])
 def sales_form():
     operator = request.args.get("operator", "Operator")
-    sellable_items = get_dropdown_items("Finished Goods") + get_dropdown_items("Semi-Finished") + get_dropdown_items("Raw Material")
+    sellable_items = (get_dropdown_items("Finished Goods") + get_dropdown_items("Semi-Finished")
+                      + get_dropdown_items("Raw Material") + get_dropdown_items("Consumables"))
     return render_template_string(SALES_FORM_HTML, operator=operator, default_time=default_entry_time(),
                                    finished_goods_items=sellable_items)
 
@@ -5062,6 +5092,15 @@ PNL_REPORT_HTML = BASE_STYLE + """
   <div class="pnl-row"><span>MS Wire Sales</span><span>Rs. {{ pnl.ms_wire_revenue }}</span></div>
   <div class="pnl-row"><span>Scrap Sales</span><span>Rs. {{ pnl.scrap_revenue }}</span></div>
   <div class="pnl-row"><span>Wire Rod Sales</span><span>Rs. {{ pnl.wire_rod_revenue }}</span></div>
+  {% if pnl.consumables_sold_revenue %}
+  <div class="pnl-row"><span>Consumables Sales</span><span>Rs. {{ pnl.consumables_sold_revenue }}</span></div>
+  <div class="pnl-detail-block">
+    {% for c in pnl.consumables_sold_breakdown %}
+    {{ c.item }}: {{ c.qty }} kg &mdash; revenue Rs. {{ c.revenue }} &minus; cost Rs. {{ c.cost }} (at Rs. {{ c.cost_rate }}/kg latest receipt rate) = <strong>Rs. {{ c.profit }}</strong><br>
+    {% endfor %}
+  </div>
+  <div class="pnl-row nested"><span>Profit on Consumables Sold Directly: Rs. {{ pnl.consumables_sold_revenue }} revenue &minus; Rs. {{ pnl.consumables_sold_cost }} cost</span><span class="{{ 'badge-bad' if pnl.consumables_sold_profit < 0 else '' }}">Rs. {{ pnl.consumables_sold_profit }}</span></div>
+  {% endif %}
   <div class="pnl-row total"><span>Total Revenue</span><span>Rs. {{ pnl.total_revenue }}</span></div>
 
   <div class="pnl-hero {{ 'loss' if pnl.gross_profit < 0 else 'profit' }}">
@@ -5155,6 +5194,15 @@ INSIGHTS_HTML = BASE_STYLE + """
     <tr style="font-weight:700;"><td>TOTAL</td><td>{{ rm_total_qty }}</td><td>Rs. {{ rm_total_revenue }}</td><td>Rs. {{ rm_overall_avg }}</td></tr>
   </table></div>
 
+  <h2 class="section">Consumables Sold (Zinc, Lead, etc. - if any)</h2>
+  <div class="table-wrap"><table>
+    <tr><th>Item</th><th>Qty Sold</th><th>Revenue</th><th>Avg Rate/Kg</th></tr>
+    {% for r in cons_sales_rows %}
+    <tr><td><a href="/item-detail?item={{ r.item|urlencode }}&category=Consumables&key={{ admin_key }}" style="color:var(--ink);font-weight:600;">{{ r.item }}</a></td><td>{{ r.qty_sold }}</td><td>Rs. {{ r.revenue }}</td><td>Rs. {{ r.avg_rate }}</td></tr>
+    {% endfor %}
+    <tr style="font-weight:700;"><td>TOTAL</td><td>{{ cons_total_qty }}</td><td>Rs. {{ cons_total_revenue }}</td><td>Rs. {{ cons_overall_avg }}</td></tr>
+  </table></div>
+
   <h2 class="section">Raw Material Purchased</h2>
   <div class="table-wrap"><table>
     <tr><th>Size</th><th>Qty Received</th><th>Amount Paid</th><th>Avg Rate/Kg</th></tr>
@@ -5202,6 +5250,7 @@ def insights_page():
     fg_sales_rows, fg_total_qty, fg_total_revenue, fg_overall_avg = get_sales_insights("Finished Goods", from_date, to_date)
     sf_sales_rows, sf_total_qty, sf_total_revenue, sf_overall_avg = get_sales_insights("Semi-Finished", from_date, to_date)
     rm_sales_rows, rm_total_qty, rm_total_revenue, rm_overall_avg = get_sales_insights("Raw Material", from_date, to_date)
+    cons_sales_rows, cons_total_qty, cons_total_revenue, cons_overall_avg = get_sales_insights("Consumables", from_date, to_date)
 
     rm_purchase_rows, rm_purchase_total_qty, rm_purchase_total_amount, rm_purchase_overall_avg = \
         get_purchase_insights("Raw Material", "receipt_raw_material", from_date, to_date)
@@ -5254,6 +5303,7 @@ def insights_page():
         fg_sales_rows=fg_sales_rows, fg_total_qty=fg_total_qty, fg_total_revenue=fg_total_revenue, fg_overall_avg=fg_overall_avg,
         sf_sales_rows=sf_sales_rows, sf_total_qty=sf_total_qty, sf_total_revenue=sf_total_revenue, sf_overall_avg=sf_overall_avg,
         rm_sales_rows=rm_sales_rows, rm_total_qty=rm_total_qty, rm_total_revenue=rm_total_revenue, rm_overall_avg=rm_overall_avg,
+        cons_sales_rows=cons_sales_rows, cons_total_qty=cons_total_qty, cons_total_revenue=cons_total_revenue, cons_overall_avg=cons_overall_avg,
         rm_purchase_rows=rm_purchase_rows, rm_purchase_total_qty=rm_purchase_total_qty,
         rm_purchase_total_amount=rm_purchase_total_amount, rm_purchase_overall_avg=rm_purchase_overall_avg,
         cons_purchase_rows=cons_purchase_rows, cons_purchase_total_qty=cons_purchase_total_qty,
@@ -6039,6 +6089,16 @@ def sales_analysis():
     known_items = get_all_known_items()
     all_items = sorted(set(known_items.get("Finished Goods", [])) | set(known_items.get("Semi-Finished", [])) | set(known_items.get("Raw Material", [])))
     item_category_map = {}
+    # Consumables are sellable too - include only those actually sold, so the item picker stays short.
+    _conn = get_db_connection()
+    _cur = _conn.cursor()
+    _cur.execute("SELECT DISTINCT li.item_name FROM line_items li WHERE li.category='sale'")
+    sold_names = set(r[0] for r in _cur.fetchall())
+    _cur.close()
+    sold_consumables = [i for i in known_items.get("Consumables", []) if i in sold_names]
+    all_items = sorted(set(all_items) | set(sold_consumables))
+    for i in sold_consumables:
+        item_category_map[i] = "Consumables"
     for i in known_items.get("Finished Goods", []):
         item_category_map[i] = "Finished Goods"
     for i in known_items.get("Semi-Finished", []):
