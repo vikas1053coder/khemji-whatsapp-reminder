@@ -2428,6 +2428,8 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     qtyInput.type = 'number'; qtyInput.name = 'wr_qty[]'; qtyInput.placeholder = 'Qty (Kg)'; qtyInput.step = 'any';
 
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
+    catSelect.addEventListener('change', fillItems);
+    fillItems();
 
     row.appendChild(select); row.appendChild(customInput); row.appendChild(qtyInput);
     container.appendChild(row);
@@ -3413,7 +3415,7 @@ SALES_FORM_HTML = BASE_STYLE + """
   </div>
 </div>
 <script>
-  var financeItems = {{ finished_goods_items | tojson }};
+  var saleCategories = {{ sale_categories | tojson }};
   function addSaleItemRow() {
     var container = document.getElementById('saleItemRows');
     var row = document.createElement('div');
@@ -3422,13 +3424,23 @@ SALES_FORM_HTML = BASE_STYLE + """
     row.style.padding = '12px';
     row.style.marginBottom = '10px';
 
+    var catLabel = document.createElement('label'); catLabel.textContent = 'Category';
+    var catSelect = document.createElement('select');
+    Object.keys(saleCategories).forEach(function(c) {
+      var o = document.createElement('option'); o.value = c; o.textContent = c; catSelect.appendChild(o);
+    });
+
     var select = document.createElement('select');
     select.name = 'item[]';
-    financeItems.forEach(function(it) {
-      var opt = document.createElement('option'); opt.value = it; opt.textContent = it; select.appendChild(opt);
-    });
-    var otherOpt = document.createElement('option'); otherOpt.value = 'Other'; otherOpt.textContent = 'Other';
-    select.appendChild(otherOpt);
+    function fillItems() {
+      select.innerHTML = '';
+      (saleCategories[catSelect.value] || []).forEach(function(it) {
+        var opt = document.createElement('option'); opt.value = it; opt.textContent = it; select.appendChild(opt);
+      });
+      var otherOpt = document.createElement('option'); otherOpt.value = 'Other'; otherOpt.textContent = 'Other';
+      select.appendChild(otherOpt);
+      customInput.style.display = (select.value === 'Other') ? 'block' : 'none';
+    }
 
     var customInput = document.createElement('input');
     customInput.type = 'text'; customInput.name = 'custom_item[]'; customInput.placeholder = 'Specify item';
@@ -3449,6 +3461,7 @@ SALES_FORM_HTML = BASE_STYLE + """
     removeBtn.onclick = function() { row.remove(); };
 
     var itemLabel = document.createElement('label'); itemLabel.textContent = 'Item';
+    row.appendChild(catLabel); row.appendChild(catSelect);
     row.appendChild(itemLabel); row.appendChild(select); row.appendChild(customInput);
     row.appendChild(qtyLabel); row.appendChild(qtyInput);
     row.appendChild(priceLabel); row.appendChild(priceInput);
@@ -3463,10 +3476,14 @@ SALES_FORM_HTML = BASE_STYLE + """
 @app.route("/sales-form", methods=["GET"])
 def sales_form():
     operator = request.args.get("operator", "Operator")
-    sellable_items = (get_dropdown_items("Finished Goods") + get_dropdown_items("Semi-Finished")
-                      + get_dropdown_items("Raw Material") + get_dropdown_items("Consumables"))
+    sale_categories = {
+        "Finished Goods": get_dropdown_items("Finished Goods"),
+        "Semi-Finished (MS Wire / Scrap)": get_dropdown_items("Semi-Finished"),
+        "Raw Material (Wire Rod)": get_dropdown_items("Raw Material"),
+        "Consumables": get_dropdown_items("Consumables"),
+    }
     return render_template_string(SALES_FORM_HTML, operator=operator, default_time=default_entry_time(),
-                                   finished_goods_items=sellable_items)
+                                   sale_categories=sale_categories)
 
 
 @app.route("/submit-sale", methods=["POST"])
