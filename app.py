@@ -114,7 +114,7 @@ TEMP_RANGES = {
 # appear in dropdowns/stock automatically from then on - no code change needed.
 SEED_ITEMS = {
     "Consumables": ["Zinc", "FO", "Lead", "Galva Flux", "Coal", "Charcoal"],
-    "Raw Material": ["5.5 mm", "6.00 mm"],
+    "Raw Material": ["5.5 mm", "6.00 mm", "6.5 mm"],
     "Semi-Finished": ["MS Wire", "Scrap"],
     "Finished Goods": ["1.25 mm", "1.40 mm", "1.60 mm", "1.60 mm S", "1.70 mm", "1.75 mm", "1.80 mm", "2.00 mm",
                        "2.25 mm", "2.50 mm", "2.75 mm", "2.95 mm", "3.00 mm", "3.35 mm", "3.80 mm", "4.00 mm", "Strip 16 Kg", "Strip 23 KG"],
