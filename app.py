@@ -10,6 +10,7 @@ Khemji Wire - Phase 1: PostgreSQL-backed Operations & Inventory System
 
 import os
 import json
+import hashlib
 import uuid
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -101,6 +102,12 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "changeme123")
 SHARED_PIN = os.environ.get("SHARED_PIN", "1234")
 MAINTENANCE_PIN = os.environ.get("MAINTENANCE_PIN", "5678")
+# Business-manager login: can enter/edit/delete data and see sales rates, but
+# never P&L, monthly costs, cost analyses or revenue cards. Disabled unless
+# MANAGER_PIN is set on the server. MANAGER_KEY is derived (never typed by hand)
+# and only unlocks the whitelisted pages below - it is NOT the admin key.
+MANAGER_PIN = os.environ.get("MANAGER_PIN", "")
+MANAGER_KEY = hashlib.sha256((ADMIN_KEY + "|manager-v1").encode()).hexdigest()[:24]
 SECRET_KEY = os.environ.get("SECRET_KEY", "please-change-this-in-render-env-vars")
 
 ALL_PEOPLE_NAMES = ["Vikas", "Prakash", "Subodh", "Rana", "Mahesh", "Monu"]
@@ -222,6 +229,15 @@ CREATE TABLE IF NOT EXISTS line_items (
     price NUMERIC,
     total_amount NUMERIC,
     created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS coil_opening (
+    category TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+    coils INTEGER NOT NULL DEFAULT 0,
+    as_of_date DATE NOT NULL,
+    updated_at TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (category, item_name)
 );
 
 CREATE TABLE IF NOT EXISTS opening_stock (
@@ -390,6 +406,7 @@ def init_db():
         cur.execute("ALTER TABLE monthly_costs ADD COLUMN IF NOT EXISTS director_remuneration NUMERIC NOT NULL DEFAULT 0")
         cur.execute("ALTER TABLE preventive_maintenance_schedule ADD COLUMN IF NOT EXISTS last_cost NUMERIC")
         cur.execute("ALTER TABLE opening_stock ADD COLUMN IF NOT EXISTS opening_value NUMERIC")
+        cur.execute("ALTER TABLE line_items ADD COLUMN IF NOT EXISTS coils INTEGER")
         cur.execute("ALTER TABLE pnl_opening_bootstrap ADD COLUMN IF NOT EXISTS for_month TEXT")
         cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS authority TEXT")
 
@@ -987,15 +1004,16 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
     rows = []
     for category_db, label in category_map.get(category_label, []):
         cur.execute("""
-            SELECT s.entry_date, s.entry_time, s.operator, li.quantity
+            SELECT s.entry_date, s.entry_time, s.operator, li.quantity, li.coils
             FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
             WHERE li.category=%s AND li.item_name=%s AND s.entry_date BETWEEN %s AND %s
             ORDER BY s.entry_date, s.entry_time
         """, (category_db, item_name, from_date, to_date))
-        for entry_date, entry_time, operator, qty in cur.fetchall():
+        for entry_date, entry_time, operator, qty, coils in cur.fetchall():
             direction = "in" if label in ("Received", "Produced") else "out"
             rows.append({"entry_date": entry_date, "entry_time": entry_time, "operator": operator,
-                        "action": label, "quantity": float(qty), "direction": direction})
+                        "action": label, "quantity": float(qty), "direction": direction,
+                        "coils": int(coils) if coils is not None else None})
     cur.close()
     rows.sort(key=lambda r: (r["entry_date"], r["entry_time"]))
     return rows
@@ -1526,6 +1544,78 @@ def compute_in_out_for_date(category_label, item_name, date_str):
         return in_amt, sales_map.get(item_name, 0.0)
 
 
+
+@request_cache
+def get_coil_opening_map():
+    """{(category, item): (coils, as_of_date_str)} - the physical coil/ingot count
+    entered on the Opening Stock page. Counts before as_of_date are ignored."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT category, item_name, coils, as_of_date FROM coil_opening")
+    result = {(r[0], r[1]): (int(r[2]), r[3].strftime("%Y-%m-%d")) for r in cur.fetchall()}
+    cur.close()
+    return result
+
+
+COIL_IN_CATEGORIES = ("receipt_raw_material", "production", "receipt_finished_goods", "receipt_consumables")
+COIL_OUT_CATEGORIES = ("wire_rod", "sale", "consumption")
+
+
+@request_cache
+def compute_coil_balances(date_str):
+    """{item_name: {"opening","in","out","balance"}} as of the END of date_str.
+    Always computed live from the entries, so editing or deleting an old entry
+    fixes the count automatically. Entries with no coil count (older history)
+    simply add nothing."""
+    opening_by_item = {}
+    for (category, item), (coils, as_of) in get_coil_opening_map().items():
+        opening_by_item[item] = (coils, as_of)
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT li.item_name, li.category, s.entry_date, COALESCE(SUM(li.coils), 0)
+        FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
+        WHERE li.coils IS NOT NULL AND s.entry_date <= %s AND li.category = ANY(%s)
+        GROUP BY li.item_name, li.category, s.entry_date
+    """, (date_str, list(COIL_IN_CATEGORIES) + list(COIL_OUT_CATEGORIES)))
+    rows = cur.fetchall()
+    cur.close()
+
+    result = {}
+    def slot(item):
+        if item not in result:
+            base = opening_by_item.get(item, (0, None))
+            result[item] = {"base": base[0], "start": base[1], "before": 0, "in": 0, "out": 0}
+        return result[item]
+
+    for item in opening_by_item:
+        slot(item)
+    for item, category, entry_date, coils in rows:
+        d = entry_date.strftime("%Y-%m-%d")
+        info = slot(item)
+        if info["start"] and d < info["start"]:
+            continue
+        sign = 1 if category in COIL_IN_CATEGORIES else -1
+        amount = int(coils) * sign
+        if d == date_str:
+            if sign > 0:
+                info["in"] += int(coils)
+            else:
+                info["out"] += int(coils)
+        else:
+            info["before"] += amount
+
+    final = {}
+    for item, info in result.items():
+        if info["start"] and date_str < info["start"]:
+            continue
+        opening = info["base"] + info["before"]
+        final[item] = {"opening": opening, "in": info["in"], "out": info["out"],
+                       "balance": opening + info["in"] - info["out"]}
+    return final
+
+
 def compute_stock(selected_date=None):
     today = now_ist().strftime("%Y-%m-%d")
     date_str = selected_date or today
@@ -1586,6 +1676,7 @@ def compute_stock(selected_date=None):
             out_map = {i: sales_map.get(i, 0.0) for i in items}
 
         rows, total = [], 0.0
+        coil_map = compute_coil_balances(date_str)
         for item in items:
             if item in ledger_rows_for_date:
                 r = ledger_rows_for_date[item]
@@ -1594,7 +1685,14 @@ def compute_stock(selected_date=None):
                 op = get_live_opening(item)
                 in_amt, out_amt = in_map.get(item, 0.0), out_map.get(item, 0.0)
                 bal = round(op + in_amt - out_amt, 2)
-            rows.append({"item": item, "opening": op, "in": in_amt, "out": out_amt, "balance": bal})
+            row = {"item": item, "opening": op, "in": in_amt, "out": out_amt, "balance": bal, "coils": None}
+            if tracks_coils(category_label, item):
+                c = coil_map.get(item)
+                if c is not None:
+                    row["coils"] = c
+                    row["kg_per_coil"] = round(bal / c["balance"], 1) if c["balance"] > 0 and bal > 0 else None
+                    row["coil_unit"] = coil_unit_label(category_label, item)
+            rows.append(row)
             total += bal
         return rows, round(total, 2)
 
@@ -1974,8 +2072,52 @@ def login():
             session["authenticated"] = True
             session["role"] = "maintenance"
             return redirect("/maintenance-home")
+        elif MANAGER_PIN and entered_pin == MANAGER_PIN:
+            session.permanent = True
+            session["authenticated"] = True
+            session["role"] = "manager"
+            return redirect(f"/dashboard?key={MANAGER_KEY}")
         error = "Incorrect PIN. Please try again."
     return render_template_string(LOGIN_HTML, error=error)
+
+
+# ---------- Business-manager role ----------
+# A manager session may visit ONLY these paths (entry forms, dashboard, edit /
+# delete, stock + operational analyses). Everything else - P&L, monthly costs,
+# cost structure, insights, electricity/consumables cost analyses, opening
+# value, expense logging - answers 403, even if he types the address by hand.
+MANAGER_ALLOWED_PATHS = {
+    "/app-home", "/", "/login",
+    "/furnace-form", "/submit-furnace", "/production-form", "/submit-production",
+    "/electricity-form", "/submit-electricity", "/receipt-form", "/submit-receipt",
+    "/sales-form", "/submit-sale", "/operator-dashboard", "/dashboard",
+    "/edit-entry", "/save-edit", "/delete-entry", "/confirm-delete",
+    "/bulk-delete-readings", "/bulk-delete-line-items", "/delete-submission", "/confirm-delete-submission",
+    "/item-detail", "/day-detail", "/production-analysis", "/furnace-analysis",
+    "/check-duplicates", "/opening-stock",
+    "/spares-form", "/submit-spares", "/breakdown-form", "/submit-breakdown",
+    "/resolve-breakdown", "/confirm-resolve-breakdown", "/preventive-maintenance",
+    "/add-preventive-schedule", "/mark-preventive-done",
+}
+
+
+def is_manager():
+    return session.get("role") == "manager"
+
+
+def active_key():
+    """The key to embed in links/forms for the current viewer. A manager is
+    handed the derived manager key, never the real admin key."""
+    return MANAGER_KEY if is_manager() else ADMIN_KEY
+
+
+def key_ok(provided):
+    """True if the supplied key unlocks an admin-style page for this viewer."""
+    if not provided:
+        return False
+    if provided == ADMIN_KEY:
+        return True
+    return bool(is_manager() and provided == MANAGER_KEY and request.path in MANAGER_ALLOWED_PATHS)
 
 
 MAINTENANCE_ALLOWED_PATHS = {
@@ -1999,6 +2141,8 @@ def require_pin():
         return redirect(f"/login?next={quote(target, safe='')}")
     if session.get("role") == "maintenance" and request.path not in MAINTENANCE_ALLOWED_PATHS:
         return redirect("/maintenance-home")
+    if session.get("role") == "manager" and request.path not in MANAGER_ALLOWED_PATHS:
+        abort(403)
 
 
 # ---------- Home ----------
@@ -2026,7 +2170,11 @@ HOME_HTML = BASE_STYLE + """
     <button class="home-btn" style="background:#3B5C7A;" onclick="goTo('/electricity-form')"><span class="icon">&#9889;</span> Electricity &amp; Wire Rod</button>
     <button class="home-btn" style="background:#2E7D32;" onclick="goTo('/receipt-form')"><span class="icon">&#128230;</span> Log Stock Receipt</button>
     <button class="home-btn" style="background:#8B5E00;" onclick="goTo('/sales-form')"><span class="icon">&#128176;</span> Log a Sale</button>
+    {% if manager_key %}
+    <a class="home-btn" style="background:#1A1A1A;" href="/dashboard?key={{ manager_key }}"><span class="icon">&#128202;</span> Manager Dashboard (edit)</a>
+    {% else %}
     <a class="home-btn" style="background:#1A1A1A;" href="/operator-dashboard"><span class="icon">&#128202;</span> View Stock Dashboard</a>
+    {% endif %}
     <button class="home-btn" style="background:#5C6B78;" onclick="goTo('/spares-form')"><span class="icon">&#128295;</span> Spares Stock</button>
     <button class="home-btn" style="background:#D64545;" onclick="goTo('/breakdown-form')"><span class="icon">&#9888;</span> Report Breakdown</button>
     <button class="home-btn" style="background:#B8860B;" onclick="goTo('/preventive-maintenance')"><span class="icon">&#128197;</span> Preventive Maintenance</button>
@@ -2047,7 +2195,8 @@ HOME_HTML = BASE_STYLE + """
 @app.route("/app-home", methods=["GET"])
 @app.route("/", methods=["GET"])
 def app_home():
-    return render_template_string(HOME_HTML, all_names=sorted(ALL_PEOPLE_NAMES))
+    return render_template_string(HOME_HTML, all_names=sorted(ALL_PEOPLE_NAMES),
+                                   manager_key=MANAGER_KEY if is_manager() else "")
 
 
 MAINTENANCE_HOME_HTML = BASE_STYLE + """
@@ -2235,7 +2384,7 @@ PRODUCTION_FORM_HTML = BASE_STYLE + """
   var consumptionItemsList = {{ consumption_items | tojson }};
   var productionItemsList = {{ production_items | tojson }};
 
-  function buildItemRow(containerId, itemsList, itemFieldName, qtyFieldName, itemLabel) {
+  function buildItemRow(containerId, itemsList, itemFieldName, qtyFieldName, itemLabel, coilFieldName, coilKind) {
     var container = document.getElementById(containerId);
     var row = document.createElement('div');
     row.className = 'extra-row';
@@ -2248,15 +2397,37 @@ PRODUCTION_FORM_HTML = BASE_STYLE + """
       '<select name="' + itemFieldName + '" onchange="toggleCustomInRow(this)">' + options + '<option value="Other">Other</option></select>' +
       '<input type="text" name="' + itemFieldName.replace('[]', '_custom[]') + '" placeholder="Specify item" style="display:none;margin-top:4px;">' +
       '<label>Quantity</label>' +
-      '<input type="number" name="' + qtyFieldName + '" step="any" placeholder="Qty">';
+      '<input type="number" name="' + qtyFieldName + '" step="any" placeholder="Qty">' +
+      '<div class="coil-box" style="display:none;"><label class="coil-label">No. of Coils</label>' +
+      '<input type="number" name="' + coilFieldName + '" class="coil-input" step="1" min="0" inputmode="numeric"></div>';
     container.appendChild(row);
+
+    var selectEl = row.querySelector('select');
+    var customEl = row.querySelector('input[type="text"]');
+    var qtyEl = row.querySelector('input[name="' + qtyFieldName + '"]');
+    var coilBox = row.querySelector('.coil-box');
+    var coilLabel = row.querySelector('.coil-label');
+    var coilInput = row.querySelector('.coil-input');
+    function refreshCoil() {
+      var item = selectEl.value === 'Other' ? customEl.value.trim() : selectEl.value;
+      var label = null;
+      if (coilKind === 'fg') { label = 'No. of Coils'; }
+      else if (coilKind === 'cons' && (item === 'Zinc' || item === 'Lead')) { label = 'No. of Ingots'; }
+      coilBox.style.display = label ? 'block' : 'none';
+      coilInput.required = !!label && qtyEl.value !== '';
+      if (!label) { coilInput.value = ''; } else { coilLabel.textContent = label; }
+    }
+    selectEl.addEventListener('change', refreshCoil);
+    customEl.addEventListener('input', refreshCoil);
+    qtyEl.addEventListener('input', refreshCoil);
+    refreshCoil();
   }
 
   function addConsumptionRow() {
-    buildItemRow('consumptionRows', consumptionItemsList, 'cons_item[]', 'cons_qty[]', 'Consumable Item');
+    buildItemRow('consumptionRows', consumptionItemsList, 'cons_item[]', 'cons_qty[]', 'Consumable Item', 'cons_coils[]', 'cons');
   }
   function addProductionRow() {
-    buildItemRow('productionRows', productionItemsList, 'prod_item[]', 'prod_qty[]', 'Finished Goods Item');
+    buildItemRow('productionRows', productionItemsList, 'prod_item[]', 'prod_qty[]', 'Finished Goods Item', 'prod_coils[]', 'fg');
   }
   function toggleCustomInRow(selectEl) {
     var customInput = selectEl.nextElementSibling;
@@ -2312,13 +2483,17 @@ def submit_production():
     cons_items = request.form.getlist("cons_item[]")
     cons_customs = request.form.getlist("cons_item_custom[]")
     cons_qtys = request.form.getlist("cons_qty[]")
-    for item, custom, qty in zip(cons_items, cons_customs, cons_qtys):
+    cons_coils = request.form.getlist("cons_coils[]")
+    while len(cons_coils) < len(cons_items):
+        cons_coils.append("")
+    for item, custom, qty, coil_raw in zip(cons_items, cons_customs, cons_qtys, cons_coils):
         final_item = custom.strip() if item == "Other" and custom.strip() else item
         q = safe_float(qty)
         if final_item and q != 0:
             cur.execute(
-                "INSERT INTO line_items (batch_id, category, item_name, quantity) VALUES (%s,%s,%s,%s)",
-                (batch_id_cons, "consumption", final_item, q),
+                "INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                (batch_id_cons, "consumption", final_item, q,
+                 parse_coils(coil_raw) if final_item in COIL_CONSUMABLES else None),
             )
 
     # Production submission
@@ -2329,13 +2504,16 @@ def submit_production():
     prod_items = request.form.getlist("prod_item[]")
     prod_customs = request.form.getlist("prod_item_custom[]")
     prod_qtys = request.form.getlist("prod_qty[]")
-    for item, custom, qty in zip(prod_items, prod_customs, prod_qtys):
+    prod_coils = request.form.getlist("prod_coils[]")
+    while len(prod_coils) < len(prod_items):
+        prod_coils.append("")
+    for item, custom, qty, coil_raw in zip(prod_items, prod_customs, prod_qtys, prod_coils):
         final_item = custom.strip() if item == "Other" and custom.strip() else item
         q = safe_float(qty)
         if final_item and q != 0:
             cur.execute(
-                "INSERT INTO line_items (batch_id, category, item_name, quantity) VALUES (%s,%s,%s,%s)",
-                (batch_id_prod, "production", final_item, q),
+                "INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                (batch_id_prod, "production", final_item, q, parse_coils(coil_raw)),
             )
 
     conn.commit()
@@ -2427,9 +2605,13 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     var qtyInput = document.createElement('input');
     qtyInput.type = 'number'; qtyInput.name = 'wr_qty[]'; qtyInput.placeholder = 'Qty (Kg)'; qtyInput.step = 'any';
 
+    var coilInput = document.createElement('input');
+    coilInput.type = 'number'; coilInput.name = 'wr_coils[]'; coilInput.placeholder = 'No. of Coils'; coilInput.step = '1'; coilInput.min = '0';
+    coilInput.setAttribute('inputmode', 'numeric');
+
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
 
-    row.appendChild(select); row.appendChild(customInput); row.appendChild(qtyInput);
+    row.appendChild(select); row.appendChild(customInput); row.appendChild(qtyInput); row.appendChild(coilInput);
     container.appendChild(row);
   }
   addWireRodRow();
@@ -2475,13 +2657,15 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     var sizes = document.getElementsByName('wr_size[]');
     var customs = document.getElementsByName('wr_custom_size[]');
     var qtys = document.getElementsByName('wr_qty[]');
+    var wrCoils = document.getElementsByName('wr_coils[]');
     var totalMsWire = 0;
     for (var i = 0; i < sizes.length; i++) {
       var qty = qtys[i].value;
       if (!qty) continue;
+      if (wrCoils[i].value === '') { alert('Please enter the No. of Coils for every Wire Rod entry.'); wrCoils[i].focus(); return; }
       var sizeLabel = (sizes[i].value === 'Other' && customs[i].value) ? customs[i].value : sizes[i].value;
-      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + '</span><b>' + qty + ' Kg</b></div>';
-      totalMsWire += parseFloat(qty) * 1000 * conversionFactor;
+      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + '</span><b>' + qty + ' Kg (' + wrCoils[i].value + ' coils)</b></div>';
+      totalMsWire += parseFloat(qty) * conversionFactor;
     }
     if (totalMsWire > 0) {
       rows += '<div class="review-row"><span>MS Wire Produced (auto, in Kg)</span><b>' + totalMsWire.toFixed(2) + ' kg</b></div>';
@@ -2534,6 +2718,9 @@ def submit_electricity():
     wr_sizes = request.form.getlist("wr_size[]")
     wr_customs = request.form.getlist("wr_custom_size[]")
     wr_qtys = request.form.getlist("wr_qty[]")
+    wr_coils = request.form.getlist("wr_coils[]")
+    while len(wr_coils) < len(wr_sizes):
+        wr_coils.append("")
 
     ms_items = request.form.getlist("ms_item[]")
     ms_customs = request.form.getlist("ms_custom_item[]")
@@ -2550,15 +2737,15 @@ def submit_electricity():
     mirror_row = {"Date": date_str, "Time": time_str, "Operator": operator, "Electricity Units": units}
     total_ms_wire_produced = 0.0
     total_scrap_produced = 0.0
-    for size, custom, qty in zip(wr_sizes, wr_customs, wr_qtys):
+    for size, custom, qty, coil_raw in zip(wr_sizes, wr_customs, wr_qtys, wr_coils):
         if not qty:
             continue
         final_size = custom.strip() if size == "Other" and custom.strip() else size
         q_kg = safe_float(qty)  # Wire Rod is entered directly in Kg now, same as everything else
         if q_kg != 0:
             cur.execute(
-                "INSERT INTO line_items (batch_id, category, item_name, quantity) VALUES (%s,%s,%s,%s)",
-                (batch_id, "wire_rod", final_size, q_kg),
+                "INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                (batch_id, "wire_rod", final_size, q_kg, parse_coils(coil_raw)),
             )
             total_ms_wire_produced += q_kg * MS_WIRE_CONVERSION_FACTOR
             total_scrap_produced += q_kg * (MS_WIRE_SCRAP_PERCENT / 100)
@@ -2609,6 +2796,43 @@ def submit_electricity():
     return render_template_string(SUCCESS_HTML, operator=operator, alerts=None)
 
 
+
+# ---------- Coils / Ingots (stock verification by count) ----------
+# Raw Material (wire rod) and Finished Goods are counted in COILS; Zinc and Lead
+# in INGOTS. MS Wire and Scrap are deliberately not counted. Counts never touch
+# costing or the P&L - they exist only to cross-check physical stock.
+COIL_CONSUMABLES = {"Zinc", "Lead"}
+
+COIL_JS = """
+  function coilLabelFor(cat, item) {
+    if (cat === 'Raw Material' || cat === 'Finished Goods') return 'No. of Coils';
+    if (cat === 'Consumables' && (item === 'Zinc' || item === 'Lead')) return 'No. of Ingots';
+    return null;
+  }
+"""
+
+
+def parse_coils(raw):
+    """Whole-number coil/ingot count from a form field, or None if blank/invalid."""
+    try:
+        txt = str(raw).strip()
+        if txt == "":
+            return None
+        value = int(round(float(txt)))
+        return value if value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def tracks_coils(category_label, item_name):
+    if category_label in ("Raw Material", "Finished Goods"):
+        return True
+    return category_label == "Consumables" and item_name in COIL_CONSUMABLES
+
+
+def coil_unit_label(category_label, item_name):
+    return "ingots" if category_label == "Consumables" else "coils"
+
 # ---------- Stock: Receipts ----------
 RECEIPT_FORM_HTML = BASE_STYLE + """
 <div class="card">
@@ -2632,6 +2856,11 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
     <label>Quantity Received</label>
     <input type="number" name="quantity" step="any" required>
 
+    <div id="coilBox" style="display:none;">
+      <label id="coilLabel">No. of Coils</label>
+      <input type="number" name="coils" id="coilInput" step="1" min="0" inputmode="numeric">
+    </div>
+
     <label>Rate (Rs./Kg)</label>
     <input type="number" name="rate" step="any">
 
@@ -2649,6 +2878,16 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
 </div>
 <script>
   var categoryItems = {{ category_items | tojson }};
+  function updateCoilBox() {
+    var cat = document.getElementById('categorySelect').value;
+    var item = document.getElementById('itemSelect').value;
+    if (item === 'Other') { item = document.getElementById('customItem').value.trim(); }
+    var lab = coilLabelFor(cat, item);
+    var box = document.getElementById('coilBox'), inp = document.getElementById('coilInput');
+    box.style.display = lab ? 'block' : 'none';
+    inp.required = !!lab;
+    if (!lab) { inp.value = ''; } else { document.getElementById('coilLabel').textContent = lab; }
+  }
   function updateItems() {
     var cat = document.getElementById('categorySelect').value;
     var itemSelect = document.getElementById('itemSelect');
@@ -2660,11 +2899,14 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
     itemSelect.appendChild(otherOpt);
     itemSelect.onchange = function() {
       document.getElementById('customItem').style.display = (itemSelect.value === 'Other') ? 'block' : 'none';
+      updateCoilBox();
     };
+    updateCoilBox();
   }
+  document.getElementById('customItem').addEventListener('input', updateCoilBox);
   updateItems();
 </script>
-""" + confirm_flow_script("receiptForm", "receiptReview", "receiptReviewPanel")
+""".replace("</script>", COIL_JS + "</script>", 1) + confirm_flow_script("receiptForm", "receiptReview", "receiptReviewPanel")
 
 
 @app.route("/receipt-form", methods=["GET"])
@@ -2700,9 +2942,10 @@ def submit_receipt():
         "INSERT INTO submissions (batch_id, form_type, entry_date, entry_time, operator) VALUES (%s,%s,%s,%s,%s)",
         (batch_id, "receipt", date_str, time_str, operator),
     )
+    coils = parse_coils(request.form.get("coils")) if tracks_coils(category, final_item) else None
     cur.execute(
-        "INSERT INTO line_items (batch_id, category, item_name, quantity, price, total_amount) VALUES (%s,%s,%s,%s,%s,%s)",
-        (batch_id, category_db, final_item, quantity, rate, total_value),
+        "INSERT INTO line_items (batch_id, category, item_name, quantity, price, total_amount, coils) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (batch_id, category_db, final_item, quantity, rate, total_value, coils),
     )
     conn.commit()
     cur.close()
@@ -2930,7 +3173,7 @@ RESOLVE_BREAKDOWN_HTML = BASE_STYLE + """
 
 @app.route("/resolve-breakdown", methods=["GET"])
 def resolve_breakdown_form():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     breakdown_id = request.args.get("id", "")
     conn = get_db_connection()
@@ -2941,12 +3184,12 @@ def resolve_breakdown_form():
     if not row:
         abort(404)
     breakdown = {"id": row[0], "machine": row[1], "issue_description": row[2]}
-    return render_template_string(RESOLVE_BREAKDOWN_HTML, admin_key=ADMIN_KEY, breakdown=breakdown, default_time=default_entry_time())
+    return render_template_string(RESOLVE_BREAKDOWN_HTML, admin_key=active_key(), breakdown=breakdown, default_time=default_entry_time())
 
 
 @app.route("/confirm-resolve-breakdown", methods=["POST"])
 def confirm_resolve_breakdown():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     breakdown_id = request.form.get("breakdown_id", "")
     raw_resolved = request.form.get("resolved_time", "").strip()
@@ -2972,7 +3215,7 @@ def confirm_resolve_breakdown():
     cur.close()
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/maintenance-dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/maintenance-dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 # ---------- Maintenance: Preventive Maintenance ----------
@@ -3034,14 +3277,14 @@ PREVENTIVE_LIST_HTML = BASE_STYLE + """
 def preventive_maintenance_list():
     operator = request.args.get("operator", "Operator")
     admin_key_param = request.args.get("key", "")
-    show_edit = (admin_key_param == ADMIN_KEY)
+    show_edit = key_ok(admin_key_param)
     return render_template_string(PREVENTIVE_LIST_HTML, schedule=get_preventive_schedule(), machines=get_known_machines(),
-                                   show_edit=show_edit, admin_key=ADMIN_KEY, operator=operator)
+                                   show_edit=show_edit, admin_key=active_key(), operator=operator)
 
 
 @app.route("/add-preventive-schedule", methods=["POST"])
 def add_preventive_schedule():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     machine = request.form.get("machine", "")
     task = request.form.get("task", "")
@@ -3057,7 +3300,7 @@ def add_preventive_schedule():
     cur.close()
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/preventive-maintenance?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/preventive-maintenance?key={active_key()}";}}, 1200);</script>'
 
 
 @app.route("/mark-preventive-done", methods=["GET"])
@@ -3102,7 +3345,7 @@ SET_PREVENTIVE_COST_HTML = BASE_STYLE + """
 
 @app.route("/set-preventive-cost", methods=["GET"])
 def set_preventive_cost_form():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     schedule_id = request.args.get("id", "")
     conn = get_db_connection()
@@ -3112,13 +3355,13 @@ def set_preventive_cost_form():
     cur.close()
     if not row:
         abort(404)
-    return render_template_string(SET_PREVENTIVE_COST_HTML, admin_key=ADMIN_KEY, schedule_id=schedule_id,
+    return render_template_string(SET_PREVENTIVE_COST_HTML, admin_key=active_key(), schedule_id=schedule_id,
                                    machine=row[0], task=row[1], current_cost=row[2] if row[2] is not None else "")
 
 
 @app.route("/confirm-preventive-cost", methods=["POST"])
 def confirm_preventive_cost():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     schedule_id = request.form.get("schedule_id", "")
     cost = request.form.get("cost", "")
@@ -3131,7 +3374,7 @@ def confirm_preventive_cost():
     cur.close()
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/maintenance-dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/maintenance-dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 MAINTENANCE_DASHBOARD_HTML = BASE_STYLE + """
@@ -3263,7 +3506,7 @@ def log_maintenance_expense_form():
     cur.close()
     month_total = round(sum(e["amount"] for e in expenses), 2)
 
-    return render_template_string(MAINTENANCE_EXPENSE_HTML, admin_key=ADMIN_KEY, operator=operator, today=now_ist().strftime("%Y-%m-%d"),
+    return render_template_string(MAINTENANCE_EXPENSE_HTML, admin_key=active_key(), operator=operator, today=now_ist().strftime("%Y-%m-%d"),
                                    machines=get_known_machines(), expenses=expenses, month_total=month_total, view_month=month_str)
 
 
@@ -3358,7 +3601,7 @@ def submit_maintenance_expense():
 @app.route("/maintenance-dashboard", methods=["GET"])
 def maintenance_dashboard():
     admin_key_param = request.args.get("key", "")
-    show_edit = (admin_key_param == ADMIN_KEY)
+    show_edit = key_ok(admin_key_param)
 
     schedule = get_preventive_schedule()
     overdue_count = sum(1 for s in schedule if s["status"] == "overdue")
@@ -3378,7 +3621,7 @@ def maintenance_dashboard():
     return render_template_string(
         MAINTENANCE_DASHBOARD_HTML, schedule=schedule, overdue_count=overdue_count,
         breakdowns=breakdowns, unresolved_count=unresolved_count,
-        spares_stock=compute_spares_stock(), show_edit=show_edit, admin_key=ADMIN_KEY,
+        spares_stock=compute_spares_stock(), show_edit=show_edit, admin_key=active_key(),
     )
 
 
@@ -3414,6 +3657,11 @@ SALES_FORM_HTML = BASE_STYLE + """
 </div>
 <script>
   var saleCategories = {{ sale_categories | tojson }};
+  function coilLabelFor(cat, item) {
+    if (cat === 'Raw Material' || cat === 'Finished Goods') return 'No. of Coils';
+    if (cat === 'Consumables' && (item === 'Zinc' || item === 'Lead')) return 'No. of Ingots';
+    return null;
+  }
   function addSaleItemRow() {
     var container = document.getElementById('saleItemRows');
     var row = document.createElement('div');
@@ -3451,6 +3699,26 @@ SALES_FORM_HTML = BASE_STYLE + """
     var qtyInput = document.createElement('input');
     qtyInput.type = 'number'; qtyInput.name = 'quantity[]'; qtyInput.step = 'any';
 
+    var coilBox = document.createElement('div'); coilBox.style.display = 'none';
+    var coilLab = document.createElement('label'); coilLab.textContent = 'No. of Coils';
+    var coilInput = document.createElement('input');
+    coilInput.type = 'number'; coilInput.name = 'coils[]'; coilInput.step = '1'; coilInput.min = '0'; coilInput.setAttribute('inputmode', 'numeric');
+    coilBox.appendChild(coilLab); coilBox.appendChild(coilInput);
+    function updateCoil() {
+      var cat = catSelect.value.indexOf('Finished') === 0 ? 'Finished Goods'
+              : catSelect.value.indexOf('Raw') === 0 ? 'Raw Material'
+              : catSelect.value.indexOf('Consumables') === 0 ? 'Consumables' : 'Other';
+      var item = select.value === 'Other' ? customInput.value.trim() : select.value;
+      var lab = coilLabelFor(cat, item);
+      coilBox.style.display = lab ? 'block' : 'none';
+      coilInput.required = !!lab;
+      if (!lab) { coilInput.value = ''; } else { coilLab.textContent = lab; }
+    }
+    select.addEventListener('change', updateCoil);
+    catSelect.addEventListener('change', updateCoil);
+    customInput.addEventListener('input', updateCoil);
+    updateCoil();
+
     var priceLabel = document.createElement('label'); priceLabel.textContent = 'Sale Price (Rs./Kg)';
     var priceInput = document.createElement('input');
     priceInput.type = 'number'; priceInput.name = 'price[]'; priceInput.step = 'any';
@@ -3464,6 +3732,7 @@ SALES_FORM_HTML = BASE_STYLE + """
     row.appendChild(catLabel); row.appendChild(catSelect);
     row.appendChild(itemLabel); row.appendChild(select); row.appendChild(customInput);
     row.appendChild(qtyLabel); row.appendChild(qtyInput);
+    row.appendChild(coilBox);
     row.appendChild(priceLabel); row.appendChild(priceInput);
     row.appendChild(removeBtn);
     container.appendChild(row);
@@ -3499,6 +3768,9 @@ def submit_sale():
     customs = request.form.getlist("custom_item[]")
     quantities = request.form.getlist("quantity[]")
     prices = request.form.getlist("price[]")
+    coil_values = request.form.getlist("coils[]")
+    while len(coil_values) < len(items):
+        coil_values.append("")
 
     batch_id = str(uuid.uuid4())
     conn = get_db_connection()
@@ -3508,17 +3780,25 @@ def submit_sale():
         (batch_id, "sale", date_str, time_str, operator, customer),
     )
 
+    known_for_coils = get_all_known_items()
     line_summaries = []
-    for item, custom, qty_raw, price_raw in zip(items, customs, quantities, prices):
+    for item, custom, qty_raw, price_raw, coil_raw in zip(items, customs, quantities, prices, coil_values):
         final_item = custom.strip() if item == "Other" and custom.strip() else item
         qty = safe_float(qty_raw)
         price = safe_float(price_raw)
         if not final_item or qty == 0:
             continue
         total_amount = round(qty * price, 2)
+        sale_coils = None
+        if final_item in known_for_coils.get("Raw Material", []) or final_item in SEED_ITEMS.get("Raw Material", []):
+            sale_coils = parse_coils(coil_raw)
+        elif final_item in known_for_coils.get("Finished Goods", []) or final_item in SEED_ITEMS.get("Finished Goods", []):
+            sale_coils = parse_coils(coil_raw)
+        elif final_item in COIL_CONSUMABLES:
+            sale_coils = parse_coils(coil_raw)
         cur.execute(
-            "INSERT INTO line_items (batch_id, category, item_name, quantity, price, total_amount) VALUES (%s,%s,%s,%s,%s,%s)",
-            (batch_id, "sale", final_item, qty, price, total_amount),
+            "INSERT INTO line_items (batch_id, category, item_name, quantity, price, total_amount, coils) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+            (batch_id, "sale", final_item, qty, price, total_amount, sale_coils),
         )
         line_summaries.append((final_item, qty, price, total_amount))
 
@@ -3560,7 +3840,7 @@ def get_recent_line_items(categories, limit=12, operator_filter=None, date_filte
     cur = conn.cursor()
     query = """
         SELECT li.id, s.entry_date, s.entry_time, s.operator, li.category, li.item_name,
-               li.quantity, li.price, li.total_amount, s.customer, s.electricity_units, li.batch_id
+               li.quantity, li.price, li.total_amount, s.customer, s.electricity_units, li.batch_id, li.coils
         FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
         WHERE li.category = ANY(%s)
     """
@@ -3741,22 +4021,22 @@ DASHBOARD_HTML = BASE_STYLE + """
   <div class="admin-sidebar">
     <div class="side-logo-box"><img src="/static/logo.png" alt="Khemji Wire"></div>
     <a class="side-link active" href="/dashboard?key={{ admin_key }}">&#128202; Dashboard</a>
-    <a class="side-link" href="/monthly-costs?key={{ admin_key }}">&#128181; Monthly Costs</a>
-    <a class="side-link" href="/pnl-report?key={{ admin_key }}">&#128200; P&amp;L Report</a>
-    <a class="side-link" href="/insights?key={{ admin_key }}">&#128269; Insights</a>
+    {% if not hide_money %}<a class="side-link" href="/monthly-costs?key={{ admin_key }}">&#128181; Monthly Costs</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/pnl-report?key={{ admin_key }}">&#128200; P&amp;L Report</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/insights?key={{ admin_key }}">&#128269; Insights</a>{% endif %}
     <a class="side-link" href="/check-duplicates?key={{ admin_key }}">&#128203; Check Duplicates</a>
-    <a class="side-link" href="/consumables-analysis?key={{ admin_key }}">&#128200; Consumables Analysis</a>
-    <a class="side-link" href="/electricity-analysis?key={{ admin_key }}">&#9889; Electricity Analysis</a>
-    <a class="side-link" href="/cost-structure-analysis?key={{ admin_key }}">&#128202; Cost Structure Analysis</a>
+    {% if not hide_money %}<a class="side-link" href="/consumables-analysis?key={{ admin_key }}">&#128200; Consumables Analysis</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/electricity-analysis?key={{ admin_key }}">&#9889; Electricity Analysis</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/cost-structure-analysis?key={{ admin_key }}">&#128202; Cost Structure Analysis</a>{% endif %}
     <a class="side-link" href="/furnace-analysis?key={{ admin_key }}">&#128293; Furnace Analysis</a>
-    <a class="side-link" href="/machine-downtime-analysis?key={{ admin_key }}">&#128295; Machine Downtime</a>
+    {% if not hide_money %}<a class="side-link" href="/machine-downtime-analysis?key={{ admin_key }}">&#128295; Machine Downtime</a>{% endif %}
     <a class="side-link" href="/production-analysis?key={{ admin_key }}">&#128230; Production Analysis</a>
-    <a class="side-link" href="/sales-analysis?key={{ admin_key }}">&#128176; Sales Analysis</a>
+    {% if not hide_money %}<a class="side-link" href="/sales-analysis?key={{ admin_key }}">&#128176; Sales Analysis</a>{% endif %}
     <a class="side-link" href="/opening-stock?key={{ admin_key }}">&#128230; Opening Stock</a>
-    <a class="side-link" href="/set-opening-value?key={{ admin_key }}">&#128176; Opening Value (P&amp;L)</a>
-    <a class="side-link" href="/set-semi-finished-stock?key={{ admin_key }}">&#128230; MS Wire / Scrap Stock</a>
-    <a class="side-link" href="/maintenance-dashboard?key={{ admin_key }}">&#128736; Maintenance</a>
-    <a class="side-link" href="/log-expense?key={{ admin_key }}">&#128179; Log Expense</a>
+    {% if not hide_money %}<a class="side-link" href="/set-opening-value?key={{ admin_key }}">&#128176; Opening Value (P&amp;L)</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/set-semi-finished-stock?key={{ admin_key }}">&#128230; MS Wire / Scrap Stock</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/maintenance-dashboard?key={{ admin_key }}">&#128736; Maintenance</a>{% endif %}
+    {% if not hide_money %}<a class="side-link" href="/log-expense?key={{ admin_key }}">&#128179; Log Expense</a>{% endif %}
     <div class="side-divider"></div>
     <a class="side-link" href="/app-home">&larr; Entry Forms</a>
   </div>
@@ -3800,17 +4080,19 @@ DASHBOARD_HTML = BASE_STYLE + """
       <div class="kpi-label">Qty Sold ({{ selected_date }})</div>
       <div class="kpi-value">{{ day_sales_qty }}</div>
     </a>
+    {% if not hide_money %}
     <a href="/day-detail?date={{ selected_date }}&section=sales&key={{ admin_key }}" class="kpi-card c4" style="display:block;text-decoration:none;color:inherit;cursor:pointer;">
       <div class="kpi-label">Revenue ({{ selected_date }})</div>
       <div class="kpi-value">Rs. {{ day_sales_revenue }}</div>
     </a>
+    {% endif %}
     {% if top_seller %}
     <div class="kpi-card c5">
       <div class="kpi-label">Top Seller</div>
       <div class="kpi-value" style="font-size:17px;">{{ top_seller.item }}<br><span style="font-size:13px;font-weight:400;">{{ top_seller.qty }} units</span></div>
     </div>
     {% endif %}
-    {% if show_sales %}
+    {% if show_sales and not hide_money %}
     <a href="/log-expense?key={{ admin_key }}" class="kpi-card" style="display:block;text-decoration:none;color:inherit;cursor:pointer;background:linear-gradient(135deg,#8B5E00 0%,#5E3F00 100%);">
       <div class="kpi-label">This Month's Expenses</div>
       <div class="kpi-value">Rs. {{ month_expenses_total }}</div>
@@ -3916,8 +4198,8 @@ DASHBOARD_HTML = BASE_STYLE + """
 
   <div id="table-raw" class="cat-block">
     <div class="cat-total-row"><span>Total Raw Material Balance</span><span class="cat-total-value">{{ totals.raw_material }}</span></div>
-    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th></tr>
-    {% for row in raw_material_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Raw+Material" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    {% for row in raw_material_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Raw+Material" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
   <div id="table-semifinished" class="cat-block" style="display:none;">
@@ -3928,18 +4210,18 @@ DASHBOARD_HTML = BASE_STYLE + """
   </div>
   <div id="table-finished" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Finished Goods Balance</span><span class="cat-total-value">{{ totals.finished_goods }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th></tr>
-    {% for row in finished_goods_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Finished+Goods" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    {% for row in finished_goods_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Finished+Goods" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
   <div id="table-consumables" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Consumables Balance</span><span class="cat-total-value">{{ totals.consumables }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th></tr>
-    {% for row in consumables_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Consumables" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    {% for row in consumables_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Consumables" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
 
-  {% if show_sales %}
+  {% if show_sales and not hide_money %}
   <div style="display:flex;gap:12px;margin:20px 0;flex-wrap:wrap;">
     <a href="/pnl-report?key={{ admin_key }}" style="flex:1;min-width:200px;text-align:center;padding:14px 0;background:var(--accent-dark);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;font-size:14px;">View Profit &amp; Loss Statement</a>
     <a href="/monthly-costs?key={{ admin_key }}" style="flex:1;min-width:200px;text-align:center;padding:14px 0;background:var(--ink);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;font-size:14px;">Set Monthly Fixed Costs</a>
@@ -4008,7 +4290,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <div class="stat-card" style="border-left:4px solid var(--accent);"><div class="label">Received ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.receipts }}</div></div>
     {% if show_sales and 'sales_qty' in monthly_report %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Qty Sold ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.sales_qty }}</div></div>
+    {% if not hide_money %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Revenue ({{ monthly_report.month }})</div><div class="value">Rs. {{ monthly_report.sales_revenue }}</div></div>
+    {% endif %}
     {% endif %}
     {% endif %}
     {% if 'produced' in monthly_report %}
@@ -4017,14 +4301,18 @@ DASHBOARD_HTML = BASE_STYLE + """
     <div class="stat-card" style="border-left:4px solid #B8860B;"><div class="label">Received ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.receipts }}</div></div>
     {% if show_sales and 'sales_qty' in monthly_report %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Qty Sold ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.sales_qty }}</div></div>
+    {% if not hide_money %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Revenue ({{ monthly_report.month }})</div><div class="value">Rs. {{ monthly_report.sales_revenue }}</div></div>
+    {% endif %}
     {% endif %}
     {% endif %}
     {% if 'production' in monthly_report %}
     <div class="stat-card" style="border-left:4px solid var(--ink);"><div class="label">Production ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.production }}</div></div>
     {% if show_sales and 'sales_qty' in monthly_report %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Qty Sold ({{ monthly_report.month }})</div><div class="value">{{ monthly_report.sales_qty }}</div></div>
+    {% if not hide_money %}
     <div class="stat-card" style="border-left:4px solid #8B5E00;"><div class="label">Revenue ({{ monthly_report.month }})</div><div class="value">Rs. {{ monthly_report.sales_revenue }}</div></div>
+    {% endif %}
     {% endif %}
     {% endif %}
   </div>
@@ -4067,7 +4355,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in production_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4076,7 +4364,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4091,7 +4379,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in consumption_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4100,7 +4388,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4115,7 +4403,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in electricity_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4124,7 +4412,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th></tr>
-        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4139,7 +4427,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th><th>Edit</th></tr>
         {% for r in receipts_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4148,7 +4436,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th></tr>
-        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
+        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4164,7 +4452,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th><th>Edit</th></tr>
         {% for r in sales_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4173,7 +4461,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th></tr>
-        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
+        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4398,9 +4686,15 @@ def render_dashboard(is_admin, selected_date=None, operator_filter=None, report_
     daily_yield = compute_yield_report("date", date_str)
     monthly_yield = compute_yield_report("month", month_str)
     chart_metric = chart_metric or "production"
+    chart_metric_options = CHART_METRIC_OPTIONS
+    if is_manager():
+        chart_metric_options = {k: v for k, v in CHART_METRIC_OPTIONS.items() if k not in ("sales_revenue", "general_expenses", "maintenance_cost")}
+        if chart_metric not in chart_metric_options:
+            chart_metric = "production"
     trend_labels, trend_values, trend_label = get_metric_trend(chart_metric, 7) if is_admin else ([], [], "")
     trend_full_dates = [(now_ist() - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(6, -1, -1)] if is_admin else []
-    month_expenses_total = round(sum_general_expenses_for_month(today[:7]) + sum_maintenance_cost_for_month(today[:7]), 2) if is_admin else 0
+    hide_money = is_manager()
+    month_expenses_total = round(sum_general_expenses_for_month(today[:7]) + sum_maintenance_cost_for_month(today[:7]), 2) if (is_admin and not hide_money) else 0
 
     if item_for_report.startswith("__TOTAL__"):
         cat_for_total = item_for_report.replace("__TOTAL__", "")
@@ -4444,7 +4738,7 @@ def render_dashboard(is_admin, selected_date=None, operator_filter=None, report_
 
     return render_template_string(
         DASHBOARD_HTML,
-        admin_key=ADMIN_KEY if is_admin else "",
+        admin_key=active_key() if is_admin else "",
         show_sales=is_admin, show_edit=is_admin,
         selected_date=date_str, is_today=is_today,
         operator_filter=operator_filter or "", all_operator_names=sorted(ALL_PEOPLE_NAMES),
@@ -4454,7 +4748,7 @@ def render_dashboard(is_admin, selected_date=None, operator_filter=None, report_
         all_report_items=all_report_items, category_totals_options=category_totals_options,
         daily_yield=daily_yield, monthly_yield=monthly_yield,
         trend_labels=trend_labels, trend_values=trend_values, trend_label=trend_label, trend_full_dates=trend_full_dates,
-        chart_metric=chart_metric, chart_metric_options=CHART_METRIC_OPTIONS, month_expenses_total=month_expenses_total,
+        chart_metric=chart_metric, chart_metric_options=chart_metric_options, month_expenses_total=month_expenses_total, hide_money=hide_money,
         ms_wire_pct=round(MS_WIRE_CONVERSION_FACTOR * 100), zinc_pct=round(ZINC_YIELD_FACTOR * 100),
         report_item=item_for_report, report_month=month_str, monthly_report=monthly_report,
         consumables_stock=consumables_stock, raw_material_stock=raw_material_stock,
@@ -4466,7 +4760,7 @@ def render_dashboard(is_admin, selected_date=None, operator_filter=None, report_
 
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     try:
         return render_dashboard(
@@ -4540,7 +4834,7 @@ DELETE_CONFIRM_HTML = BASE_STYLE + """
 """
 
 READINGS_COLUMNS = ["entry_date", "entry_time", "operator", "t1", "t2", "t3", "b1", "b1_hours", "b2", "b2_hours", "alerts"]
-LINE_ITEMS_COLUMNS = ["item_name", "quantity", "price", "total_amount"]
+LINE_ITEMS_COLUMNS = ["item_name", "quantity", "price", "total_amount", "coils"]
 SUBMISSION_COLUMNS = ["entry_date", "entry_time", "operator"]
 NOT_NULL_COLUMNS = {
     "line_items": {"item_name", "quantity"},
@@ -4551,7 +4845,7 @@ NOT_NULL_SUBMISSION_COLUMNS = {"entry_date", "entry_time", "operator"}
 
 @app.route("/edit-entry", methods=["GET"])
 def edit_entry():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     table = request.args.get("table", "")
     row_id = request.args.get("id", "")
@@ -4587,13 +4881,13 @@ def edit_entry():
         fields = list(zip(sub_columns, sub_row)) + list(zip(LINE_ITEMS_COLUMNS, item_values))
         protected = NOT_NULL_COLUMNS["line_items"] | NOT_NULL_SUBMISSION_COLUMNS
 
-    return render_template_string(EDIT_FORM_HTML, table=table, row_id=row_id, fields=fields, admin_key=ADMIN_KEY,
+    return render_template_string(EDIT_FORM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key(),
                                    protected_columns=protected)
 
 
 @app.route("/save-edit", methods=["POST"])
 def save_edit():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     table = request.form.get("table", "")
     row_id = request.form.get("row_id", "")
@@ -4681,12 +4975,12 @@ def save_edit():
     resync_sheet_for_table(table)
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 @app.route("/delete-entry", methods=["GET"])
 def delete_entry_confirm():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     table = request.args.get("table", "")
     row_id = request.args.get("id", "")
@@ -4703,12 +4997,12 @@ def delete_entry_confirm():
         abort(404)
 
     fields = list(zip(columns, row))
-    return render_template_string(DELETE_CONFIRM_HTML, table=table, row_id=row_id, fields=fields, admin_key=ADMIN_KEY)
+    return render_template_string(DELETE_CONFIRM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key())
 
 
 @app.route("/confirm-delete", methods=["POST"])
 def confirm_delete():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     table = request.form.get("table", "")
     row_id = request.form.get("row_id", "")
@@ -4746,7 +5040,7 @@ def confirm_delete():
     resync_sheet_for_table(table)
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 DELETE_SUBMISSION_CONFIRM_HTML = BASE_STYLE + """
@@ -4773,7 +5067,7 @@ DELETE_SUBMISSION_CONFIRM_HTML = BASE_STYLE + """
 
 @app.route("/bulk-delete-readings", methods=["POST"])
 def bulk_delete_readings():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     ids = request.form.getlist("delete_ids[]")
     if ids:
@@ -4792,12 +5086,12 @@ def bulk_delete_readings():
         resync_sheet_for_table("readings")
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 @app.route("/bulk-delete-line-items", methods=["POST"])
 def bulk_delete_line_items():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     ids = request.form.getlist("delete_ids[]")
     if ids:
@@ -4824,12 +5118,12 @@ def bulk_delete_line_items():
         resync_sheet_for_table("line_items")
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 @app.route("/delete-submission", methods=["GET"])
 def delete_submission_confirm():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     batch_id = request.args.get("batch_id", "")
     if not batch_id:
@@ -4847,14 +5141,14 @@ def delete_submission_confirm():
     cur.close()
 
     return render_template_string(
-        DELETE_SUBMISSION_CONFIRM_HTML, batch_id=batch_id, admin_key=ADMIN_KEY,
+        DELETE_SUBMISSION_CONFIRM_HTML, batch_id=batch_id, admin_key=active_key(),
         date=sub[0], time=sub[1], operator=sub[2], items=items,
     )
 
 
 @app.route("/confirm-delete-submission", methods=["POST"])
 def confirm_delete_submission():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     batch_id = request.form.get("batch_id", "")
     if not batch_id:
@@ -4877,7 +5171,7 @@ def confirm_delete_submission():
     resync_sheet_for_table("line_items")
 
     return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={ADMIN_KEY}";}}, 1200);</script>'
+        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
 
 
 # ---------- Admin: set opening stock ----------
@@ -4893,16 +5187,21 @@ OPENING_STOCK_HTML = BASE_STYLE + """
       Enter the stock as it was at the start of this date - not including that day's own production/sales.
       The system automatically adds/subtracts everything already logged for that date onward.
     </p>
+    <p style="font-size:12px;color:var(--ink-soft);">Coil / ingot counts: enter the PHYSICAL count at the start of the date above. From that date onward the system adds every coil received/produced and subtracts every coil issued/sold. Leave blank to keep the existing count.</p>
     <h2 class="section">Consumables</h2>
     {% for item, qty, value in consumables %}
     <label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}">
+    {% if item in coil_consumables %}
+    <label>{{ item }} - No. of Ingots</label><input type="number" step="1" min="0" name="coils_{{ item }}" value="{{ coil_open.get(item, '') }}">
+    {% endif %}
     {% endfor %}
     <h2 class="section">Raw Material</h2>
     <p style="font-size:12px;color:var(--ink-soft);">Value (Rs.) is optional - only needed for the very first month, as a starting cost basis. After that it carries forward automatically.</p>
     {% for item, qty, value in raw_material %}
     <div class="extra-row">
       <div style="flex:1;"><label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}"></div>
-      <div style="flex:1;"><label>{{ item }} - Value (Rs.)</label><input type="number" step="any" name="value_{{ item }}" value="{{ value if value is not none else '' }}"></div>
+      <div style="flex:1;"><label>{{ item }} - No. of Coils</label><input type="number" step="1" min="0" name="coils_{{ item }}" value="{{ coil_open.get(item, '') }}"></div>
+      {% if not hide_money %}<div style="flex:1;"><label>{{ item }} - Value (Rs.)</label><input type="number" step="any" name="value_{{ item }}" value="{{ value if value is not none else '' }}"></div>{% endif %}
     </div>
     {% endfor %}
     <h2 class="section">Semi-Finished (MS Wire, Scrap)</h2>
@@ -4910,12 +5209,15 @@ OPENING_STOCK_HTML = BASE_STYLE + """
     {% for item, qty, value in semi_finished %}
     <div class="extra-row">
       <div style="flex:1;"><label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}"></div>
-      <div style="flex:1;"><label>{{ item }} - Value (Rs.)</label><input type="number" step="any" name="value_{{ item }}" value="{{ value if value is not none else '' }}"></div>
+      {% if not hide_money %}<div style="flex:1;"><label>{{ item }} - Value (Rs.)</label><input type="number" step="any" name="value_{{ item }}" value="{{ value if value is not none else '' }}"></div>{% endif %}
     </div>
     {% endfor %}
     <h2 class="section">Finished Goods</h2>
     {% for item, qty, value in finished_goods %}
-    <label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}">
+    <div class="extra-row">
+      <div style="flex:1;"><label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}"></div>
+      <div style="flex:1;"><label>{{ item }} - No. of Coils</label><input type="number" step="1" min="0" name="coils_{{ item }}" value="{{ coil_open.get(item, '') }}"></div>
+    </div>
     {% endfor %}
     <button class="submit" type="submit">Save Opening Stock</button>
   </form>
@@ -4977,7 +5279,7 @@ MONTHLY_COSTS_HTML = BASE_STYLE + """
 
 @app.route("/monthly-costs", methods=["GET", "POST"])
 def monthly_costs_admin():
-    if request.args.get("key") != ADMIN_KEY and request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")) and not key_ok(request.form.get("key")):
         abort(403)
 
     month = request.values.get("month") or now_ist().strftime("%Y-%m")
@@ -5009,7 +5311,7 @@ def monthly_costs_admin():
     other_costs_this_month = sum_general_expenses_for_month(month)
     maintenance_cost_this_month = sum_maintenance_cost_for_month(month)
 
-    return render_template_string(MONTHLY_COSTS_HTML, admin_key=ADMIN_KEY, month=month, costs=costs,
+    return render_template_string(MONTHLY_COSTS_HTML, admin_key=active_key(), month=month, costs=costs,
                                    other_costs_this_month=other_costs_this_month,
                                    maintenance_cost_this_month=maintenance_cost_this_month)
 
@@ -5143,7 +5445,7 @@ PNL_REPORT_HTML = BASE_STYLE + """
 
 @app.route("/pnl-report", methods=["GET", "POST"])
 def pnl_report():
-    if request.args.get("key") != ADMIN_KEY and request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")) and not key_ok(request.form.get("key")):
         abort(403)
 
     month_str = request.values.get("month") or now_ist().strftime("%Y-%m")
@@ -5153,7 +5455,7 @@ def pnl_report():
         manual_opening_fg_value = safe_float(raw) if raw else None
 
     pnl = compute_pnl(month_str, manual_opening_fg_value)
-    return render_template_string(PNL_REPORT_HTML, admin_key=ADMIN_KEY, pnl=pnl)
+    return render_template_string(PNL_REPORT_HTML, admin_key=active_key(), pnl=pnl)
 
 
 INSIGHTS_HTML = BASE_STYLE + """
@@ -5257,7 +5559,7 @@ INSIGHTS_HTML = BASE_STYLE + """
 
 @app.route("/insights", methods=["GET"])
 def insights_page():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     today = now_ist().strftime("%Y-%m-%d")
@@ -5316,7 +5618,7 @@ def insights_page():
         pct_change = None
 
     return render_template_string(
-        INSIGHTS_HTML, admin_key=ADMIN_KEY, from_date=from_date, to_date=to_date,
+        INSIGHTS_HTML, admin_key=active_key(), from_date=from_date, to_date=to_date,
         fg_sales_rows=fg_sales_rows, fg_total_qty=fg_total_qty, fg_total_revenue=fg_total_revenue, fg_overall_avg=fg_overall_avg,
         sf_sales_rows=sf_sales_rows, sf_total_qty=sf_total_qty, sf_total_revenue=sf_total_revenue, sf_overall_avg=sf_overall_avg,
         rm_sales_rows=rm_sales_rows, rm_total_qty=rm_total_qty, rm_total_revenue=rm_total_revenue, rm_overall_avg=rm_overall_avg,
@@ -5410,7 +5712,7 @@ EDIT_GENERAL_EXPENSE_HTML = BASE_STYLE + """
 @app.route("/log-expense", methods=["GET"])
 def log_expense_form():
     operator = request.args.get("operator", "Operator")
-    came_from_admin = request.args.get("key") == ADMIN_KEY
+    came_from_admin = key_ok(request.args.get("key"))
     month_str = request.args.get("month") or now_ist().strftime("%Y-%m")
     conn = get_db_connection()
     cur = conn.cursor()
@@ -5422,7 +5724,7 @@ def log_expense_form():
     cur.close()
     month_total = round(sum(e["amount"] for e in expenses), 2)
 
-    return render_template_string(GENERAL_EXPENSE_HTML, admin_key=ADMIN_KEY, operator=operator, today=now_ist().strftime("%Y-%m-%d"),
+    return render_template_string(GENERAL_EXPENSE_HTML, admin_key=active_key(), operator=operator, today=now_ist().strftime("%Y-%m-%d"),
                                    categories=EXPENSE_CATEGORIES, expenses=expenses, month_total=month_total,
                                    view_month=month_str, came_from_admin=came_from_admin)
 
@@ -5440,7 +5742,7 @@ def submit_general_expense():
     conn.commit()
     cur.close()
 
-    key_param = f"&key={ADMIN_KEY}" if request.form.get("came_from_admin") == "1" else ""
+    key_param = f"&key={active_key()}" if request.form.get("came_from_admin") == "1" else ""
     return render_template_string(SUCCESS_HTML, operator=operator, alerts=None) + \
         f'<script>setTimeout(function(){{window.location.href="/log-expense?operator={operator}{key_param}";}}, 1200);</script>'
 
@@ -5449,7 +5751,7 @@ def submit_general_expense():
 def edit_general_expense():
     expense_id = request.args.get("id", "")
     operator = request.args.get("operator", "Operator")
-    key_param = request.args.get("key", "") if request.args.get("key") == ADMIN_KEY else ""
+    key_param = request.args.get("key", "") if key_ok(request.args.get("key")) else ""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT id, entry_date, category, description, amount FROM general_expenses WHERE id=%s", (expense_id,))
@@ -5465,7 +5767,7 @@ def edit_general_expense():
 def save_general_expense():
     expense_id = request.form.get("id", "")
     operator = request.form.get("operator", "Operator")
-    key_param = f"&key={request.form.get('key_param')}" if request.form.get("key_param") == ADMIN_KEY else ""
+    key_param = f"&key={request.form.get('key_param')}" if key_ok(request.form.get("key_param")) else ""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -5483,7 +5785,7 @@ def delete_general_expense():
     expense_id = request.args.get("id", "")
     operator = request.args.get("operator", "Operator")
     month = request.args.get("month", "")
-    key_param = f"&key={request.args.get('key')}" if request.args.get("key") == ADMIN_KEY else ""
+    key_param = f"&key={request.args.get('key')}" if key_ok(request.args.get("key")) else ""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("DELETE FROM general_expenses WHERE id=%s", (expense_id,))
@@ -5513,19 +5815,23 @@ ITEM_DETAIL_HTML = BASE_STYLE + """
     <div class="stat-card"><div class="label">Closing Balance ({{ to_date }})</div><div class="value">{{ closing_balance }}</div></div>
     <div class="stat-card"><div class="label">Total In</div><div class="value">{{ total_in }}</div></div>
     <div class="stat-card"><div class="label">Total Out</div><div class="value">{{ total_out }}</div></div>
+    {% if coil_unit and coil_info %}
+    <div class="stat-card" style="border-left:4px solid var(--accent);"><div class="label">{{ coil_unit|capitalize }} Balance ({{ to_date }})</div><div class="value">{{ coil_info.balance }}</div></div>
+    <div class="stat-card"><div class="label">{{ coil_unit|capitalize }} Opening ({{ from_date }})</div><div class="value">{{ coil_opening_at_from }}</div></div>
+    {% endif %}
   </div>
 
   <h2 class="section">Transaction History</h2>
   <div class="table-wrap"><table>
-    <tr><th>Date</th><th>Time</th><th>Action</th><th>Qty</th><th>Operator</th></tr>
+    <tr><th>Date</th><th>Time</th><th>Action</th><th>Qty</th>{% if coil_unit %}<th>{{ coil_unit|capitalize }}</th>{% endif %}<th>Operator</th></tr>
     {% for t in transactions %}
     <tr>
       <td>{{ t.entry_date }}</td><td>{{ t.entry_time }}</td>
       <td class="{{ 'badge-ok' if t.direction == 'in' else 'badge-bad' }}">{{ t.action }}</td>
-      <td>{{ t.quantity }}</td><td>{{ t.operator }}</td>
+      <td>{{ t.quantity }}</td>{% if coil_unit %}<td>{{ t.coils if t.coils is not none else '-' }}</td>{% endif %}<td>{{ t.operator }}</td>
     </tr>
     {% endfor %}
-    {% if not transactions %}<tr><td colspan="5" style="text-align:center;color:var(--ink-soft);">No transactions in this date range</td></tr>{% endif %}
+    {% if not transactions %}<tr><td colspan="6" style="text-align:center;color:var(--ink-soft);">No transactions in this date range</td></tr>{% endif %}
   </table></div>
 
   <a href="javascript:history.back()" style="display:block;text-align:center;margin-top:20px;color:var(--accent-dark);font-weight:700;text-decoration:none;">&larr; Back</a>
@@ -5551,10 +5857,21 @@ def item_detail():
     total_in = round(sum(t["quantity"] for t in transactions if t["direction"] == "in"), 2)
     total_out = round(sum(t["quantity"] for t in transactions if t["direction"] == "out"), 2)
 
+    coil_unit, coil_info, coil_opening_at_from = None, None, None
+    if tracks_coils(category, item):
+        coil_unit = coil_unit_label(category, item)
+        coil_info = compute_coil_balances(to_date).get(item)
+        day_before = (datetime.strptime(from_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        before = compute_coil_balances(day_before).get(item)
+        coil_opening_at_from = before["balance"] if before else 0
+        if coil_info is None:
+            coil_unit = None  # no coil count set up for this item yet
+
     return render_template_string(ITEM_DETAIL_HTML, item=item, category=category, operator_param=operator_param,
                                    from_date=from_date, to_date=to_date, opening_balance=round(opening_balance, 2),
                                    closing_balance=round(closing_balance, 2), total_in=total_in, total_out=total_out,
-                                   transactions=transactions)
+                                   transactions=transactions, coil_unit=coil_unit, coil_info=coil_info,
+                                   coil_opening_at_from=coil_opening_at_from)
 
 
 DAY_DETAIL_HTML = BASE_STYLE + """
@@ -5583,7 +5900,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Production</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not production_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5592,7 +5909,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Consumption</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not consumption_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5601,7 +5918,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Electricity &amp; Wire Rod</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not electricity_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5610,7 +5927,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Receipts</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td></tr>{% endfor %}
+    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not receipts_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5619,7 +5936,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Sales</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Revenue</th></tr>
-    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
+    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
     {% if not sales_rows %}<tr><td colspan="5" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5633,7 +5950,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
 def day_detail():
     selected_date = request.args.get("date") or now_ist().strftime("%Y-%m-%d")
     admin_key_param = request.args.get("key", "")
-    show_sales = (admin_key_param == ADMIN_KEY)
+    show_sales = key_ok(admin_key_param)
     section = request.args.get("section", "")  # empty = show everything
 
     furnace_rows, production_rows, consumption_rows, electricity_rows, receipts_rows, sales_rows = [], [], [], [], [], []
@@ -5854,7 +6171,7 @@ PRODUCTION_ANALYSIS_HTML = BASE_STYLE + """
 
 @app.route("/production-analysis", methods=["GET"])
 def production_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     all_items = get_dropdown_items("Finished Goods")
@@ -5956,7 +6273,7 @@ def production_analysis():
         trend_values.append(round(by_date.get(d_str, 0.0), 2))
         d += timedelta(days=1)
 
-    return render_template_string(PRODUCTION_ANALYSIS_HTML, admin_key=ADMIN_KEY, all_items=all_items,
+    return render_template_string(PRODUCTION_ANALYSIS_HTML, admin_key=active_key(), all_items=all_items,
                                    selected_item=selected_item, from_date=from_date, to_date=to_date,
                                    overall_labels=overall_labels, overall_values=overall_values, total_kg=total_kg,
                                    prev_total_kg=prev_total_kg, pct_change=pct_change, prev_from=prev_from, prev_to=prev_to,
@@ -6100,7 +6417,7 @@ SALES_ANALYSIS_HTML = BASE_STYLE + """
 
 @app.route("/sales-analysis", methods=["GET"])
 def sales_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     known_items = get_all_known_items()
@@ -6253,7 +6570,7 @@ def sales_analysis():
         trend_values.append(round(by_date.get(d_str, 0.0), 2))
         d += timedelta(days=1)
 
-    return render_template_string(SALES_ANALYSIS_HTML, admin_key=ADMIN_KEY, all_items=all_items,
+    return render_template_string(SALES_ANALYSIS_HTML, admin_key=active_key(), all_items=all_items,
                                    selected_item=selected_item, from_date=from_date, to_date=to_date,
                                    overall_labels=overall_labels, overall_values=overall_values, total_revenue=total_revenue,
                                    prev_total_revenue=prev_total_revenue, pct_change=pct_change, prev_from=prev_from, prev_to=prev_to,
@@ -6265,7 +6582,7 @@ def sales_analysis():
 
 @app.route("/consumables-analysis", methods=["GET"])
 def consumables_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     all_items = get_dropdown_items("Consumables")
@@ -6349,7 +6666,7 @@ def consumables_analysis():
         monthly_rows.append({"month": m, "fg_tonnes": fg_tonnes_m, "cost": month_cost, "cost_per_tonne": cost_per_tonne_m})
     cur.close()
 
-    return render_template_string(CONSUMABLES_ANALYSIS_HTML, admin_key=ADMIN_KEY, all_items=all_items,
+    return render_template_string(CONSUMABLES_ANALYSIS_HTML, admin_key=active_key(), all_items=all_items,
                                    selected_item=selected_item, from_date=from_date, to_date=to_date,
                                    trend_labels=trend_labels, trend_values=trend_values, summary_rows=summary_rows,
                                    total_fg_tonnes=total_fg_tonnes, total_cost=total_cost,
@@ -6520,7 +6837,7 @@ COST_STRUCTURE_HTML = BASE_STYLE + """
 
 @app.route("/cost-structure-analysis", methods=["GET"])
 def cost_structure_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     month = request.args.get("month") or now_ist().strftime("%Y-%m")
@@ -6619,7 +6936,7 @@ def cost_structure_analysis():
     break_even_tonnes = round(break_even_kg / 1000, 2) if break_even_kg is not None else None
     margin_of_safety_pct = round(((fg_produced_kg - break_even_kg) / fg_produced_kg) * 100, 1) if (break_even_kg and fg_produced_kg > 0) else None
 
-    return render_template_string(COST_STRUCTURE_HTML, admin_key=ADMIN_KEY, month=month, fg_tonnes=fg_tonnes,
+    return render_template_string(COST_STRUCTURE_HTML, admin_key=active_key(), month=month, fg_tonnes=fg_tonnes,
                                    avg_fg_tonnes=avg_fg_tonnes, volume_flag=volume_flag, volume_pct_below=volume_pct_below,
                                    total_cost=total_cost, total_cost_per_tonne=total_cost_per_tonne, categories=categories,
                                    trend_months=trend_months, total_trend_values=total_trend_values,
@@ -6631,7 +6948,7 @@ def cost_structure_analysis():
 
 @app.route("/electricity-analysis", methods=["GET"])
 def electricity_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     today = now_ist().strftime("%Y-%m-%d")
@@ -6718,7 +7035,7 @@ def electricity_analysis():
     estimated_cost = round(total_units * electricity_rate, 2) if electricity_rate is not None else None
     estimated_cost_per_kg = round(estimated_cost / total_fg, 2) if (estimated_cost is not None and total_fg > 0) else None
 
-    return render_template_string(ELECTRICITY_ANALYSIS_HTML, admin_key=ADMIN_KEY, from_date=from_date, to_date=to_date,
+    return render_template_string(ELECTRICITY_ANALYSIS_HTML, admin_key=active_key(), from_date=from_date, to_date=to_date,
                                    trend_labels=trend_labels, trend_values=trend_values, total_units=round(total_units, 2),
                                    total_fg=round(total_fg, 2), avg_units_per_kg=avg_units_per_kg,
                                    current_month=current_month, cost_per_kg_this_month=cost_per_kg_this_month,
@@ -6729,19 +7046,19 @@ def electricity_analysis():
 
 @app.route("/set-electricity-rate", methods=["POST"])
 def set_electricity_rate():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     rate = request.form.get("rate", "")
     if rate:
         set_setting("electricity_rate_per_unit", str(safe_float(rate)))
     from_date = request.form.get("from_date", "")
     to_date = request.form.get("to_date", "")
-    return redirect(f"/electricity-analysis?key={ADMIN_KEY}&from_date={from_date}&to_date={to_date}")
+    return redirect(f"/electricity-analysis?key={active_key()}&from_date={from_date}&to_date={to_date}")
 
 
 @app.route("/calculate-electricity-rate", methods=["POST"])
 def calculate_electricity_rate():
-    if request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.form.get("key")):
         abort(403)
     bill_month = request.form.get("bill_month", "")
     bill_amount = safe_float(request.form.get("bill_amount", "0"))
@@ -6766,7 +7083,7 @@ def calculate_electricity_rate():
         set_setting("electricity_rate_per_unit", str(rate))
         msg = f"ok:Calculated Rs. {rate}/unit from {units} units in {bill_month} - saved."
 
-    return redirect(f"/electricity-analysis?key={ADMIN_KEY}&from_date={from_date}&to_date={to_date}&bill_msg={quote(msg, safe='')}")
+    return redirect(f"/electricity-analysis?key={active_key()}&from_date={from_date}&to_date={to_date}&bill_msg={quote(msg, safe='')}")
 
 
 FURNACE_ANALYSIS_HTML = BASE_STYLE + """
@@ -6860,7 +7177,7 @@ MACHINE_DOWNTIME_HTML = BASE_STYLE + """
 
 @app.route("/machine-downtime-analysis", methods=["GET"])
 def machine_downtime_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     today = now_ist().strftime("%Y-%m-%d")
@@ -6930,7 +7247,7 @@ def machine_downtime_analysis():
         days_open = (now_ist().date() - rep_date).days
         unresolved_rows.append({"machine": machine, "reported_date": rep_date, "issue": issue, "days_open": days_open})
 
-    return render_template_string(MACHINE_DOWNTIME_HTML, admin_key=ADMIN_KEY, from_date=from_date, to_date=to_date,
+    return render_template_string(MACHINE_DOWNTIME_HTML, admin_key=active_key(), from_date=from_date, to_date=to_date,
                                    total_breakdowns=len(rows), total_downtime_hours=round(total_downtime_hours, 1),
                                    total_repair_cost=round(total_repair_cost, 2), total_lost_value=total_lost_value,
                                    machine_rows=machine_rows, unresolved_rows=unresolved_rows)
@@ -6938,7 +7255,7 @@ def machine_downtime_analysis():
 
 @app.route("/furnace-analysis", methods=["GET"])
 def furnace_analysis():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     today = now_ist().strftime("%Y-%m-%d")
@@ -6966,7 +7283,7 @@ def furnace_analysis():
         if alerts and alerts.strip().upper() not in ("", "OK", "NONE"):
             alert_count += 1
 
-    return render_template_string(FURNACE_ANALYSIS_HTML, admin_key=ADMIN_KEY, from_date=from_date, to_date=to_date,
+    return render_template_string(FURNACE_ANALYSIS_HTML, admin_key=active_key(), from_date=from_date, to_date=to_date,
                                    trend_labels=trend_labels, t1_values=t1_values, t2_values=t2_values, t3_values=t3_values,
                                    b1_total_hours=round(b1_total_hours, 2), b2_total_hours=round(b2_total_hours, 2),
                                    alert_count=alert_count)
@@ -6998,7 +7315,7 @@ SET_SEMI_FINISHED_STOCK_HTML = BASE_STYLE + """
 
 @app.route("/set-semi-finished-stock", methods=["GET", "POST"])
 def set_semi_finished_stock():
-    if request.args.get("key") != ADMIN_KEY and request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")) and not key_ok(request.form.get("key")):
         abort(403)
 
     if request.method == "POST":
@@ -7031,7 +7348,7 @@ def set_semi_finished_stock():
 
     today = now_ist().strftime("%Y-%m-%d")
     opening = get_opening_stock_map()
-    return render_template_string(SET_SEMI_FINISHED_STOCK_HTML, admin_key=ADMIN_KEY, today=today,
+    return render_template_string(SET_SEMI_FINISHED_STOCK_HTML, admin_key=active_key(), today=today,
                                    ms_wire_qty=opening.get("MS Wire", 0.0), scrap_qty=opening.get("Scrap", 0.0))
 
 
@@ -7071,7 +7388,7 @@ OPENING_VALUE_HTML = BASE_STYLE + """
 
 @app.route("/set-opening-value", methods=["GET", "POST"])
 def set_opening_value():
-    if request.args.get("key") != ADMIN_KEY and request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")) and not key_ok(request.form.get("key")):
         abort(403)
 
     # Default to the earliest month with any real data, not "today's month" -
@@ -7115,7 +7432,7 @@ def set_opening_value():
     wire_rod_qty = round(get_category_total_balance_on_date("Raw Material", now_ist().strftime("%Y-%m-%d")), 2)
     ms_wire_qty = round(get_item_balance_on_date("Semi-Finished", "MS Wire", now_ist().strftime("%Y-%m-%d")), 2)
 
-    return render_template_string(OPENING_VALUE_HTML, admin_key=ADMIN_KEY, wire_rod_value=wire_rod_value,
+    return render_template_string(OPENING_VALUE_HTML, admin_key=active_key(), wire_rod_value=wire_rod_value,
                                    ms_wire_value=ms_wire_value, wire_rod_qty=wire_rod_qty, ms_wire_qty=ms_wire_qty,
                                    wire_rod_manual_qty=wire_rod_manual_qty, ms_wire_manual_qty=ms_wire_manual_qty,
                                    for_month=for_month)
@@ -7123,7 +7440,7 @@ def set_opening_value():
 
 @app.route("/opening-stock", methods=["GET", "POST"])
 def opening_stock_admin():
-    if request.args.get("key") != ADMIN_KEY and request.form.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")) and not key_ok(request.form.get("key")):
         abort(403)
 
     ensure_opening_stock_seeded()
@@ -7141,11 +7458,23 @@ def opening_stock_admin():
                 val = request.form.get(f"qty_{item}")
                 value_raw = request.form.get(f"value_{item}", "")
                 value_val = safe_float(value_raw) if value_raw else None
-                if val is not None:
+                if val is not None and is_manager():
+                    # Manager never sees or changes opening VALUES - keep whatever is stored.
+                    cur.execute("""
+                        INSERT INTO opening_stock (item_name, category, opening_qty, updated_at) VALUES (%s,%s,%s,%s)
+                        ON CONFLICT (item_name) DO UPDATE SET opening_qty=EXCLUDED.opening_qty, updated_at=EXCLUDED.updated_at
+                    """, (item, category, safe_float(val), as_of_date))
+                elif val is not None:
                     cur.execute("""
                         INSERT INTO opening_stock (item_name, category, opening_qty, opening_value, updated_at) VALUES (%s,%s,%s,%s,%s)
                         ON CONFLICT (item_name) DO UPDATE SET opening_qty=EXCLUDED.opening_qty, opening_value=EXCLUDED.opening_value, updated_at=EXCLUDED.updated_at
                     """, (item, category, safe_float(val), value_val, as_of_date))
+                coil_raw = request.form.get(f"coils_{item}", "")
+                if tracks_coils(category, item) and parse_coils(coil_raw) is not None:
+                    cur.execute("""
+                        INSERT INTO coil_opening (category, item_name, coils, as_of_date, updated_at) VALUES (%s,%s,%s,%s,NOW())
+                        ON CONFLICT (category, item_name) DO UPDATE SET coils=EXCLUDED.coils, as_of_date=EXCLUDED.as_of_date, updated_at=NOW()
+                    """, (category, item, parse_coils(coil_raw), as_of_date))
         conn.commit()
         cur.close()
 
@@ -7168,8 +7497,10 @@ def opening_stock_admin():
     semi_finished = sorted((i, opening.get(i, 0.0), opening_values.get(i)) for i in set(SEED_ITEMS["Semi-Finished"]) | set(known["Semi-Finished"]))
     finished_goods = sorted((i, opening.get(i, 0.0), None) for i in set(SEED_ITEMS["Finished Goods"]) | set(known["Finished Goods"]))
 
-    return render_template_string(OPENING_STOCK_HTML, admin_key=ADMIN_KEY, today=now_ist().strftime("%Y-%m-%d"),
-                                   consumables=consumables, raw_material=raw_material, semi_finished=semi_finished, finished_goods=finished_goods)
+    coil_open = {k[1]: v[0] for k, v in get_coil_opening_map().items()}
+    return render_template_string(OPENING_STOCK_HTML, admin_key=active_key(), today=now_ist().strftime("%Y-%m-%d"),
+                                   consumables=consumables, raw_material=raw_material, semi_finished=semi_finished, finished_goods=finished_goods,
+                                   coil_open=coil_open, coil_consumables=sorted(COIL_CONSUMABLES), hide_money=is_manager())
 
 
 # ---------- Manual test trigger ----------
@@ -7434,7 +7765,7 @@ def migrate_opening_stock():
 
 @app.route("/migrate-from-sheets", methods=["GET"])
 def migrate_from_sheets():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     if request.args.get("confirm") != "yes":
         return """
@@ -7468,7 +7799,7 @@ def migrate_from_sheets():
     resync_sheet_for_table("readings")
     resync_sheet_for_table("line_items")
 
-    return render_template_string(MIGRATION_RESULT_HTML, counts=counts, errors=all_errors, admin_key=ADMIN_KEY)
+    return render_template_string(MIGRATION_RESULT_HTML, counts=counts, errors=all_errors, admin_key=active_key())
 
 
 DUPLICATE_CHECK_HTML = BASE_STYLE + """
@@ -7510,7 +7841,7 @@ DUPLICATE_CHECK_HTML = BASE_STYLE + """
 
 @app.route("/check-duplicates", methods=["GET"])
 def check_duplicates():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     today = now_ist().strftime("%Y-%m-%d")
@@ -7546,7 +7877,7 @@ def check_duplicates():
         groups.append({"form_type": form_type, "operator": operator, "entry_date": entry_date, "submissions": subs})
     cur.close()
 
-    return render_template_string(DUPLICATE_CHECK_HTML, admin_key=ADMIN_KEY, groups=groups, from_date=from_date, to_date=to_date)
+    return render_template_string(DUPLICATE_CHECK_HTML, admin_key=active_key(), groups=groups, from_date=from_date, to_date=to_date)
 
 
 @app.route("/shift-entry-dates", methods=["GET"])
@@ -7556,7 +7887,7 @@ def shift_entry_dates():
     for a given date range. Furnace, Receipts, and Sales are untouched, since
     those are genuinely entered same-day. Preview-then-confirm, same safe
     pattern as the other correction tools."""
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     from_date = request.args.get("from_date", "")
@@ -7601,7 +7932,7 @@ def shift_entry_dates():
         <p>{len(rows)} submissions will be shifted back by one day each:</p>
         <ul>{preview_rows}</ul>
         <p>Furnace, Receipts, and Sales in this range are NOT affected.</p>
-        <a href="?key={ADMIN_KEY}&from_date={from_date}&to_date={to_date}&confirm=yes"
+        <a href="?key={active_key()}&from_date={from_date}&to_date={to_date}&confirm=yes"
            style="display:inline-block;padding:14px 28px;background:#1B3A5C;color:white;border-radius:8px;text-decoration:none;font-weight:bold;">
            Yes, Shift These {len(rows)} Entries Back One Day</a>
         </div>
@@ -7624,7 +7955,7 @@ def shift_entry_dates():
     <div style="font-family:sans-serif;max-width:600px;margin:40px auto;">
     <h2>Done</h2>
     <p>{len(rows)} entries shifted back one day. Stock recalculated from {earliest_affected} forward.</p>
-    <a href="/dashboard?key={ADMIN_KEY}">Go to Dashboard</a>
+    <a href="/dashboard?key={active_key()}">Go to Dashboard</a>
     </div>
     """
 
@@ -7636,7 +7967,7 @@ def fix_wire_rod_receipts():
     derived MS Wire), which was already run once. Receipts never got the same
     fix, so this is scoped to touch ONLY receipt_raw_material entries for
     actual Wire Rod items - never re-touching what's already been corrected."""
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     known_items = get_all_known_items()
@@ -7689,14 +8020,14 @@ def fix_wire_rod_receipts():
     <h2>Correction Applied</h2>
     <p>{len(receipt_rows)} Wire Rod receipt entries corrected (&times;1000).</p>
     <p>StockLedger and StockHistory have been recalculated from {earliest} forward.</p>
-    <a href="/dashboard?key={ADMIN_KEY}">Go to Dashboard</a>
+    <a href="/dashboard?key={active_key()}">Go to Dashboard</a>
     </div>
     """
 
 
 @app.route("/fix-wire-rod-units", methods=["GET"])
 def fix_wire_rod_units():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
 
     conn = get_db_connection()
@@ -7761,14 +8092,14 @@ def fix_wire_rod_units():
     <p>{len(wire_rod_rows)} Wire Rod entries, {len(ms_wire_rows)} MS Wire Produced entries,
     and {len(opening_rows)} Opening Stock items corrected (&times;1000).</p>
     <p>StockLedger and StockHistory have been recalculated from {earliest} forward.</p>
-    <a href="/dashboard?key={ADMIN_KEY}">Go to Dashboard</a>
+    <a href="/dashboard?key={active_key()}">Go to Dashboard</a>
     </div>
     """
 
 
 @app.route("/test-daily-close", methods=["GET"])
 def test_daily_close():
-    if request.args.get("key") != ADMIN_KEY:
+    if not key_ok(request.args.get("key")):
         abort(403)
     target_date = request.args.get("date")  # optional: YYYY-MM-DD to backfill a specific day
     run_daily_stock_close(target_date=target_date)
