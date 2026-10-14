@@ -2087,7 +2087,7 @@ def login():
 # cost structure, insights, electricity/consumables cost analyses, opening
 # value, expense logging - answers 403, even if he types the address by hand.
 MANAGER_ALLOWED_PATHS = {
-    "/app-home", "/", "/login",
+    "/app-home", "/", "/login", "/logout",
     "/furnace-form", "/submit-furnace", "/production-form", "/submit-production",
     "/electricity-form", "/submit-electricity", "/receipt-form", "/submit-receipt",
     "/sales-form", "/submit-sale", "/operator-dashboard", "/dashboard",
@@ -2121,7 +2121,7 @@ def key_ok(provided):
 
 
 MAINTENANCE_ALLOWED_PATHS = {
-    "/maintenance-home", "/spares-form", "/submit-spares", "/breakdown-form", "/submit-breakdown",
+    "/logout", "/maintenance-home", "/spares-form", "/submit-spares", "/breakdown-form", "/submit-breakdown",
     "/resolve-breakdown", "/confirm-resolve-breakdown", "/preventive-maintenance", "/add-preventive-schedule",
     "/mark-preventive-done", "/set-preventive-cost", "/confirm-preventive-cost", "/maintenance-dashboard",
 }
@@ -2187,6 +2187,7 @@ HOME_HTML = BASE_STYLE + """
     <button class="home-btn" style="background:#8B5E00;" onclick="goTo('/log-expense')"><span class="icon">&#128179;</span> Log Expense</button>
     <button class="home-btn" style="background:#A0522D;" onclick="goTo('/log-maintenance-expense')"><span class="icon">&#128176;</span> Log Maintenance Expense</button>
   </div>
+  <p style="text-align:center;margin-top:18px;"><a href="/logout" style="color:#777;font-size:14px;">Log out</a></p>
 </div>
 <script>
   function goTo(path) {
@@ -2195,6 +2196,12 @@ HOME_HTML = BASE_STYLE + """
   }
 </script>
 """
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
 
 
 @app.route("/app-home", methods=["GET"])
@@ -2228,6 +2235,7 @@ MAINTENANCE_HOME_HTML = BASE_STYLE + """
     <button class="home-btn" style="background:#B8860B;" onclick="goTo('/preventive-maintenance')"><span class="icon">&#128197;</span> Preventive Maintenance</button>
     <a class="home-btn" style="background:#2C2C2C;" href="/maintenance-dashboard"><span class="icon">&#128736;</span> Maintenance Dashboard</a>
   </div>
+  <p style="text-align:center;margin-top:18px;"><a href="/logout" style="color:#777;font-size:14px;">Log out</a></p>
 </div>
 <script>
   function goTo(path) {
@@ -4044,6 +4052,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% if not hide_money %}<a class="side-link" href="/log-expense?key={{ admin_key }}">&#128179; Log Expense</a>{% endif %}
     <div class="side-divider"></div>
     <a class="side-link" href="/app-home">&larr; Entry Forms</a>
+    <a class="side-link" href="/logout">Log out</a>
   </div>
   <div class="admin-main">
 {% else %}
@@ -5065,8 +5074,11 @@ DELETE_SUBMISSION_CONFIRM_HTML = BASE_STYLE + """
   <form method="POST" action="/confirm-delete-submission">
     <input type="hidden" name="batch_id" value="{{ batch_id }}">
     <input type="hidden" name="key" value="{{ admin_key }}">
+    <input type="hidden" name="back" value="{{ back }}">
+    <input type="hidden" name="from_date" value="{{ from_date }}">
+    <input type="hidden" name="to_date" value="{{ to_date }}">
     <div style="display:flex;gap:10px;margin-top:10px;">
-      <a href="/dashboard?key={{ admin_key }}" style="flex:1;text-align:center;padding:15px 0;background:var(--ink);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;">Cancel</a>
+      <a href="{% if back == 'dup' %}/check-duplicates?key={{ admin_key }}&from_date={{ from_date }}&to_date={{ to_date }}{% else %}/dashboard?key={{ admin_key }}{% endif %}" style="flex:1;text-align:center;padding:15px 0;background:var(--ink);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;">Cancel</a>
       <button type="submit" style="flex:1;padding:15px 0;background:var(--bad);color:white;border:none;border-radius:8px;font-weight:700;text-transform:uppercase;cursor:pointer;">Yes, Delete All {{ items|length }} Items</button>
     </div>
   </form>
@@ -5151,6 +5163,7 @@ def delete_submission_confirm():
 
     return render_template_string(
         DELETE_SUBMISSION_CONFIRM_HTML, batch_id=batch_id, admin_key=active_key(),
+        back=request.args.get("back", ""), from_date=request.args.get("from_date", ""), to_date=request.args.get("to_date", ""),
         date=sub[0], time=sub[1], operator=sub[2], items=items,
     )
 
@@ -5179,8 +5192,12 @@ def confirm_delete_submission():
 
     resync_sheet_for_table("line_items")
 
-    return render_template_string(SUCCESS_HTML, operator="Admin", alerts=None) + \
-        f'<script>setTimeout(function(){{window.location.href="/dashboard?key={active_key()}";}}, 1200);</script>'
+    if request.form.get("back") == "dup":
+        dest = (f"/check-duplicates?key={active_key()}&from_date={quote(request.form.get('from_date', ''))}"
+                f"&to_date={quote(request.form.get('to_date', ''))}")
+    else:
+        dest = f"/dashboard?key={active_key()}"
+    return redirect(dest)
 
 
 # ---------- Admin: set opening stock ----------
@@ -7830,7 +7847,7 @@ DUPLICATE_CHECK_HTML = BASE_STYLE + """
       {% for item in sub.line_items %}<tr><td>{{ item.item_name }}</td><td>{{ item.quantity }}</td></tr>{% endfor %}
     </table>
     <div style="margin-top:8px;">
-      <a href="/delete-submission?batch_id={{ sub.batch_id }}&key={{ admin_key }}" style="color:var(--bad);font-weight:700;">Delete This Whole Entry</a>
+      <a href="/delete-submission?batch_id={{ sub.batch_id }}&key={{ admin_key }}&back=dup&from_date={{ from_date }}&to_date={{ to_date }}" style="color:var(--bad);font-weight:700;">Delete This Whole Entry</a>
     </div>
   </div>
   {% endfor %}
