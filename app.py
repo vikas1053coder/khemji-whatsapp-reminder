@@ -110,7 +110,7 @@ MANAGER_PIN = os.environ.get("MANAGER_PIN", "")
 MANAGER_KEY = hashlib.sha256((ADMIN_KEY + "|manager-v1").encode()).hexdigest()[:24]
 SECRET_KEY = os.environ.get("SECRET_KEY", "please-change-this-in-render-env-vars")
 
-ALL_PEOPLE_NAMES = ["Vikas", "Prakash", "Subodh", "Rana", "Mahesh", "Monu"]
+ALL_PEOPLE_NAMES = ["Prakash", "Subodh", "Rana", "Monu", "Manoj"]
 
 TEMP_RANGES = {
     "T1": {"low": 445, "high": 455},
@@ -2131,6 +2131,11 @@ MAINTENANCE_ALLOWED_PATHS = {
 def require_pin():
     if request.path == "/login" or request.path.startswith("/static"):
         return
+    # Opening a link that carries the real admin key upgrades a leftover manager
+    # session (same phone/browser) to full access. The manager never sees this key.
+    if session.get("role") == "manager" and request.args.get("key") == ADMIN_KEY:
+        session["authenticated"] = True
+        session["role"] = "full"
     if request.path == "/dashboard":
         return  # protected separately by its own admin key
     if not session.get("authenticated"):
@@ -4776,6 +4781,10 @@ def dashboard():
 
 @app.route("/operator-dashboard", methods=["GET"])
 def operator_dashboard():
+    if is_manager():
+        # Manager always gets the editable dashboard, never the read-only one.
+        qs = request.query_string.decode()
+        return redirect(f"/dashboard?key={MANAGER_KEY}" + (f"&{qs}" if qs else ""))
     try:
         return render_dashboard(
             is_admin=False, selected_date=request.args.get("date"),
