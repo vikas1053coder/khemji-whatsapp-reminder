@@ -2136,8 +2136,6 @@ def require_pin():
     if session.get("role") == "manager" and request.args.get("key") == ADMIN_KEY:
         session["authenticated"] = True
         session["role"] = "full"
-    if request.path == "/dashboard":
-        return  # protected separately by its own admin key
     if not session.get("authenticated"):
         # Preserve the full path AND query string (e.g. ?key=...) - losing
         # this would strip the admin key on any admin-only page visited
