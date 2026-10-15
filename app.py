@@ -662,6 +662,7 @@ def get_all_known_items():
     finished = set(r[0] for r in cur.fetchall())
     cur.execute("SELECT DISTINCT item_name FROM line_items WHERE category IN ('production','sale','receipt_finished_goods')")
     finished |= set(r[0] for r in cur.fetchall())
+    raw_material |= {n for n in finished if "|" in n}  # "5.5 mm | JSW" sold directly is still wire rod
     finished -= semi_finished  # a semi-finished item sold directly shouldn't also count as finished goods
     finished -= raw_material   # a raw material item (e.g. Wire Rod) sold directly shouldn't count as finished goods either
     finished -= consumables    # a consumable (e.g. Zinc, Lead) sold directly shouldn't count as finished goods either
@@ -678,6 +679,57 @@ def get_all_known_items():
 def get_dropdown_items(category_label):
     known = get_all_known_items().get(category_label, [])
     return sorted(set(SEED_ITEMS.get(category_label, [])) | set(known))
+
+
+# ---------- Wire rod MAKE (JSW, SAIL, ...) ----------
+# A make is stored inside the item name, "5.5 mm | JSW", so every stock, coil,
+# costing and report calculation that works per item name automatically works
+# per make. Stock with no make keeps its plain name ("5.5 mm") = old stock.
+RM_SEP = " | "
+RM_MAKES_SEED = ["JSW", "SAIL", "Godavari", "Rashmi"]
+NO_MAKE_VALUE = "__nomake__"
+NO_MAKE_LABEL = "No make (old stock)"
+
+
+def rm_base(item_name):
+    return (item_name or "").split("|")[0].strip()
+
+
+def rm_make_of(item_name):
+    parts = (item_name or "").split("|", 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def rm_compose(size, make, custom_make=""):
+    """'5.5 mm' + 'JSW' -> '5.5 mm | JSW'. Blank / 'no make' keeps the plain size."""
+    size = (size or "").strip()
+    m = (custom_make or "").strip() if make == "Other" else (make or "").strip()
+    m = m.replace("|", " ").strip()
+    if not m or m == NO_MAKE_VALUE:
+        return size
+    return f"{size}{RM_SEP}{m}"
+
+
+def get_rm_sizes():
+    """Distinct wire rod sizes (without make) for the Size dropdowns."""
+    names = set(SEED_ITEMS.get("Raw Material", [])) | set(get_all_known_items().get("Raw Material", []))
+    return sorted({rm_base(n) for n in names if rm_base(n)})
+
+
+def get_rm_makes():
+    """The four seeded makes plus any new make ever typed in via 'Other'."""
+    known = get_all_known_items().get("Raw Material", [])
+    extra = sorted({rm_make_of(n) for n in known if rm_make_of(n)} - set(RM_MAKES_SEED))
+    return RM_MAKES_SEED + extra
+
+
+def get_rm_universe(known):
+    """Every raw-material item to list on the Opening Stock page: old no-make
+    names, anything already in the data, and every size x make combination."""
+    names = set(SEED_ITEMS.get("Raw Material", [])) | set(known.get("Raw Material", []))
+    sizes = sorted({rm_base(n) for n in names if rm_base(n)})
+    makes = RM_MAKES_SEED + sorted({rm_make_of(n) for n in names if rm_make_of(n)} - set(RM_MAKES_SEED))
+    return names | {f"{sz}{RM_SEP}{mk}" for sz in sizes for mk in makes}
 
 
 @request_cache
@@ -1120,45 +1172,90 @@ def store_category_rate(category_label, month_str, rate, opening_qty, opening_va
 
 
 def compute_raw_material_weighted_avg(month_str):
-    """Weighted-average rate for Raw Material (Wire Rod), carried forward
-    monthly. Opening value/qty comes from last month's stored rate, UNLESS a
-    manual bootstrap (Opening Value page) was explicitly set - that always
-    takes priority, since it's a deliberate human override for a month where
-    no reliable prior data exists (e.g. the system's first tracked month)."""
+    """Weighted-average cost of Raw Material (Wire Rod), carried forward monthly,
+    worked out SEPARATELY for every size / make ("5.5 mm | JSW", "6.00 mm | SAIL",
+    and old no-make stock "5.5 mm"), then added up. The P&L only needs the totals
+    (opening value, purchases, closing value), so its layout is unchanged - but the
+    value of rod consumed now follows the make that was actually used.
+
+    Opening rate per item: last month's stored rate for that item; else (new make,
+    or the first month after this feature) the Opening Stock page value, else the
+    latest purchase rate, else last month's pooled rate. A manual Opening Value
+    bootstrap, when set, is spread over the opening kg at one rate."""
     first_day, last_day, prev_last_day = get_month_boundaries(month_str)
     prev_month_str = prev_last_day[:7]
 
-    bootstrap_qty, bootstrap_value = get_manual_opening_bootstrap("Raw Material", month_str)
-    if bootstrap_value is not None:
-        opening_qty = bootstrap_qty if bootstrap_qty else get_category_total_balance_on_date("Raw Material", prev_last_day)
-        opening_value = bootstrap_value
-    else:
-        opening_qty = get_category_total_balance_on_date("Raw Material", prev_last_day)
-        prev_rate = get_stored_category_rate("Raw Material", prev_month_str)
-        opening_value = round(opening_qty * prev_rate, 2) if prev_rate is not None else 0.0
+    open_balances = {r["item"]: r["balance"] for r in compute_stock(prev_last_day)[1]}
+    close_balances = {r["item"]: r["balance"] for r in compute_stock(last_day)[1]}
+    pooled_prev_rate = get_stored_category_rate("Raw Material", prev_month_str)
 
-    # This month's additions: value actually paid for Wire Rod received (from Receipts)
-    added_qty = sum_category_qty_for_month("receipt_raw_material", month_str)
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT COALESCE(SUM(li.total_amount),0) FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
+        SELECT li.item_name, COALESCE(SUM(li.quantity),0), COALESCE(SUM(li.total_amount),0)
+        FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
         WHERE li.category='receipt_raw_material' AND TO_CHAR(s.entry_date,'YYYY-MM')=%s
+        GROUP BY li.item_name
     """, (month_str,))
-    added_value = round(float(cur.fetchone()[0]), 2)
+    added = {r[0]: (float(r[1]), float(r[2])) for r in cur.fetchall()}
+    cur.execute("SELECT item_name, opening_qty, opening_value FROM opening_stock WHERE category='Raw Material'")
+    opening_rows = {r[0]: (float(r[1] or 0), float(r[2]) if r[2] is not None else None) for r in cur.fetchall()}
     cur.close()
 
-    total_qty = opening_qty + added_qty
-    total_value = opening_value + added_value
-    weighted_avg_rate = round(total_value / total_qty, 4) if total_qty > 0 else 0.0
+    bootstrap_qty, bootstrap_value = get_manual_opening_bootstrap("Raw Material", month_str)
+    total_open_kg = sum(open_balances.values())
+    bootstrap_rate = None
+    if bootstrap_value is not None:
+        base_qty = bootstrap_qty if bootstrap_qty else total_open_kg
+        bootstrap_rate = (bootstrap_value / base_qty) if base_qty else 0.0
 
-    closing_qty = get_category_total_balance_on_date("Raw Material", last_day)
-    closing_value = round(closing_qty * weighted_avg_rate, 2)
+    items = sorted(set(open_balances) | set(close_balances) | set(added))
+    item_rates = {}
+    tot = {"open_qty": 0.0, "open_value": 0.0, "added_qty": 0.0, "added_value": 0.0, "close_qty": 0.0, "close_value": 0.0}
+    for item in items:
+        open_qty = open_balances.get(item, 0.0)
+        close_qty = close_balances.get(item, 0.0)
+        add_qty, add_value = added.get(item, (0.0, 0.0))
 
-    store_category_rate("Raw Material", month_str, weighted_avg_rate, opening_qty, opening_value, closing_qty, closing_value)
-    return {"opening_qty": round(opening_qty, 2), "opening_value": round(opening_value, 2),
-            "weighted_avg_rate": weighted_avg_rate, "closing_qty": round(closing_qty, 2), "closing_value": closing_value,
-            "added_qty": round(added_qty, 2), "added_value": round(added_value, 2)}
+        if bootstrap_rate is not None:
+            open_rate = bootstrap_rate
+        else:
+            open_rate = get_stored_category_rate(f"Raw Material::{item}", prev_month_str)
+            if open_rate is None and "|" in item:
+                oq, ov = opening_rows.get(item, (0.0, None))
+                if ov is not None and oq > 0:
+                    open_rate = ov / oq
+                else:
+                    open_rate = get_rate_as_of_date(item, prev_last_day)
+            if open_rate is None:
+                open_rate = pooled_prev_rate if pooled_prev_rate is not None else 0.0
+        open_value = round(open_qty * open_rate, 2)
+
+        total_qty = open_qty + add_qty
+        total_value = open_value + add_value
+        if total_qty > 0 and total_value > 0:
+            rate = round(total_value / total_qty, 4)
+        else:
+            rate = get_rate_as_of_date(item, last_day) or open_rate or 0.0
+        close_value = round(close_qty * rate, 2)
+        item_rates[item] = rate
+        store_category_rate(f"Raw Material::{item}", month_str, rate, open_qty, open_value, close_qty, close_value)
+
+        tot["open_qty"] += open_qty; tot["open_value"] += open_value
+        tot["added_qty"] += add_qty; tot["added_value"] += add_value
+        tot["close_qty"] += close_qty; tot["close_value"] += close_value
+
+    opening_qty = bootstrap_qty if (bootstrap_value is not None and bootstrap_qty) else tot["open_qty"]
+    opening_value = round(bootstrap_value, 2) if bootstrap_value is not None else round(tot["open_value"], 2)
+    added_value = round(tot["added_value"], 2)
+    total_qty = opening_qty + tot["added_qty"]
+    weighted_avg_rate = round((opening_value + added_value) / total_qty, 4) if total_qty > 0 else 0.0
+    closing_value = round(tot["close_value"], 2)
+
+    store_category_rate("Raw Material", month_str, weighted_avg_rate, opening_qty, opening_value, tot["close_qty"], closing_value)
+    return {"opening_qty": round(opening_qty, 2), "opening_value": opening_value,
+            "weighted_avg_rate": weighted_avg_rate, "closing_qty": round(tot["close_qty"], 2), "closing_value": closing_value,
+            "added_qty": round(tot["added_qty"], 2), "added_value": added_value, "item_rates": item_rates}
 
 
 def compute_semi_finished_weighted_avg(month_str, raw_material_rate):
@@ -1210,12 +1307,13 @@ def compute_pnl(month_str, manual_opening_fg_value=None):
     #     cost shouldn't silently inflate FG's Cost of Production either. ---
     known_items_for_rm = get_all_known_items()
     rm_items = sorted(set(SEED_ITEMS.get("Raw Material", [])) | set(known_items_for_rm.get("Raw Material", [])))
-    wire_rod_sold_qty, wire_rod_sold_revenue = 0.0, 0.0
+    wire_rod_sold_qty, wire_rod_sold_revenue, wire_rod_sold_cost_raw = 0.0, 0.0, 0.0
     for item in rm_items:
         q, r = sum_sales_qty_and_revenue_for_month(item, month_str)
         wire_rod_sold_qty += q
         wire_rod_sold_revenue += r
-    wire_rod_sold_cost = round(wire_rod_sold_qty * rm["weighted_avg_rate"], 2)
+        wire_rod_sold_cost_raw += q * rm["item_rates"].get(item, rm["weighted_avg_rate"])  # that make's own rate
+    wire_rod_sold_cost = round(wire_rod_sold_cost_raw, 2)
     wire_rod_sold_profit = round(wire_rod_sold_revenue - wire_rod_sold_cost, 2)
 
     raw_material_consumed_value = round(rm["opening_value"] + rm["added_value"] - rm["closing_value"] - wire_rod_sold_cost, 2)
@@ -2590,6 +2688,7 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
 </div>
 <script>
   var wireRodSizes = {{ wire_rod_sizes | tojson }};
+  var wireRodMakes = {{ wire_rod_makes | tojson }};
   var msWireItems = {{ ms_wire_items | tojson }};
   var conversionFactor = {{ conversion_factor }};
   var wireRodRowCount = 0;
@@ -2613,6 +2712,18 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     var customInput = document.createElement('input');
     customInput.type = 'text'; customInput.name = 'wr_custom_size[]'; customInput.placeholder = 'Specify size'; customInput.style.display = 'none';
 
+    var makeSelect = document.createElement('select');
+    makeSelect.name = 'wr_make[]';
+    var mph = document.createElement('option'); mph.value = ''; mph.textContent = 'Select make'; makeSelect.appendChild(mph);
+    wireRodMakes.forEach(function(mk) {
+      var mo = document.createElement('option'); mo.value = mk; mo.textContent = mk; makeSelect.appendChild(mo);
+    });
+    var nmo = document.createElement('option'); nmo.value = '__nomake__'; nmo.textContent = 'No make (old stock)'; makeSelect.appendChild(nmo);
+    var omo = document.createElement('option'); omo.value = 'Other'; omo.textContent = 'Other (new make)'; makeSelect.appendChild(omo);
+    var customMake = document.createElement('input');
+    customMake.type = 'text'; customMake.name = 'wr_custom_make[]'; customMake.placeholder = 'Specify make'; customMake.style.display = 'none';
+    makeSelect.addEventListener('change', function() { customMake.style.display = (makeSelect.value === 'Other') ? 'block' : 'none'; });
+
     var qtyInput = document.createElement('input');
     qtyInput.type = 'number'; qtyInput.name = 'wr_qty[]'; qtyInput.placeholder = 'Qty (Kg)'; qtyInput.step = 'any';
 
@@ -2622,7 +2733,8 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
 
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
 
-    row.appendChild(select); row.appendChild(customInput); row.appendChild(qtyInput); row.appendChild(coilInput);
+    row.appendChild(select); row.appendChild(customInput); row.appendChild(makeSelect); row.appendChild(customMake);
+    row.appendChild(qtyInput); row.appendChild(coilInput);
     container.appendChild(row);
   }
   addWireRodRow();
@@ -2669,13 +2781,17 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
     var customs = document.getElementsByName('wr_custom_size[]');
     var qtys = document.getElementsByName('wr_qty[]');
     var wrCoils = document.getElementsByName('wr_coils[]');
+    var wrMakes = document.getElementsByName('wr_make[]');
+    var wrCustomMakes = document.getElementsByName('wr_custom_make[]');
     var totalMsWire = 0;
     for (var i = 0; i < sizes.length; i++) {
       var qty = qtys[i].value;
       if (!qty) continue;
+      if (wrMakes[i].value === '' || (wrMakes[i].value === 'Other' && !wrCustomMakes[i].value.trim())) { alert('Please select the Make for every Wire Rod entry.'); wrMakes[i].focus(); return; }
       if (wrCoils[i].value === '') { alert('Please enter the No. of Coils for every Wire Rod entry.'); wrCoils[i].focus(); return; }
       var sizeLabel = (sizes[i].value === 'Other' && customs[i].value) ? customs[i].value : sizes[i].value;
-      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + '</span><b>' + qty + ' Kg (' + wrCoils[i].value + ' coils)</b></div>';
+      var makeLabel = wrMakes[i].value === 'Other' ? wrCustomMakes[i].value.trim() : (wrMakes[i].value === '__nomake__' ? 'No make (old stock)' : wrMakes[i].value);
+      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + ' | ' + makeLabel + '</span><b>' + qty + ' Kg (' + wrCoils[i].value + ' coils)</b></div>';
       totalMsWire += parseFloat(qty) * conversionFactor;
     }
     if (totalMsWire > 0) {
@@ -2714,7 +2830,7 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
 def electricity_form():
     operator = request.args.get("operator", "Operator")
     return render_template_string(ELECTRICITY_FORM_HTML, operator=operator, default_time=default_entry_time_yesterday(),
-                                   wire_rod_sizes=get_dropdown_items("Raw Material"),
+                                   wire_rod_sizes=get_rm_sizes(), wire_rod_makes=get_rm_makes(),
                                    ms_wire_items=get_dropdown_items("Semi-Finished"),
                                    conversion_factor=MS_WIRE_CONVERSION_FACTOR,
                                    conversion_pct=round(MS_WIRE_CONVERSION_FACTOR * 100, 1))
@@ -2732,6 +2848,12 @@ def submit_electricity():
     wr_coils = request.form.getlist("wr_coils[]")
     while len(wr_coils) < len(wr_sizes):
         wr_coils.append("")
+    wr_makes = request.form.getlist("wr_make[]")
+    while len(wr_makes) < len(wr_sizes):
+        wr_makes.append("")
+    wr_cmakes = request.form.getlist("wr_custom_make[]")
+    while len(wr_cmakes) < len(wr_sizes):
+        wr_cmakes.append("")
 
     ms_items = request.form.getlist("ms_item[]")
     ms_customs = request.form.getlist("ms_custom_item[]")
@@ -2748,10 +2870,11 @@ def submit_electricity():
     mirror_row = {"Date": date_str, "Time": time_str, "Operator": operator, "Electricity Units": units}
     total_ms_wire_produced = 0.0
     total_scrap_produced = 0.0
-    for size, custom, qty, coil_raw in zip(wr_sizes, wr_customs, wr_qtys, wr_coils):
+    for size, custom, qty, coil_raw, mk, cmk in zip(wr_sizes, wr_customs, wr_qtys, wr_coils, wr_makes, wr_cmakes):
         if not qty:
             continue
         final_size = custom.strip() if size == "Other" and custom.strip() else size
+        final_size = rm_compose(final_size, mk, cmk)
         q_kg = safe_float(qty)  # Wire Rod is entered directly in Kg now, same as everything else
         if q_kg != 0:
             cur.execute(
@@ -2886,6 +3009,16 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
     <select id="itemSelect" name="item"></select>
     <input type="text" id="customItem" name="custom_item" placeholder="Specify item" style="display:none;margin-top:8px;">
 
+    <div id="makeBox" style="display:none;">
+      <label>Make</label>
+      <select id="makeSelect" name="make">
+        <option value="">Select make</option>
+        {% for m in rm_makes %}<option value="{{ m }}">{{ m }}</option>{% endfor %}
+        <option value="Other">Other (new make)</option>
+      </select>
+      <input type="text" id="customMake" name="custom_make" placeholder="Specify make" style="display:none;margin-top:8px;">
+    </div>
+
     <label>Quantity Received</label>
     <input type="number" name="quantity" step="any" required>
 
@@ -2921,9 +3054,20 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
     inp.required = !!lab;
     if (!lab) { inp.value = ''; } else { document.getElementById('coilLabel').textContent = lab; }
   }
+  function updateMakeBox() {
+    var show = document.getElementById('categorySelect').value === 'Raw Material';
+    var ms = document.getElementById('makeSelect'), cm = document.getElementById('customMake');
+    document.getElementById('makeBox').style.display = show ? 'block' : 'none';
+    ms.required = show;
+    if (!show) { ms.value = ''; cm.value = ''; }
+    cm.style.display = (show && ms.value === 'Other') ? 'block' : 'none';
+    cm.required = show && ms.value === 'Other';
+  }
+  document.getElementById('makeSelect').addEventListener('change', updateMakeBox);
   function updateItems() {
     var cat = document.getElementById('categorySelect').value;
     var itemSelect = document.getElementById('itemSelect');
+    updateMakeBox();
     itemSelect.innerHTML = '';
     categoryItems[cat].forEach(function(item) {
       var opt = document.createElement('option'); opt.value = item; opt.textContent = item; itemSelect.appendChild(opt);
@@ -2945,10 +3089,10 @@ RECEIPT_FORM_HTML = BASE_STYLE + """
 @app.route("/receipt-form", methods=["GET"])
 def receipt_form():
     operator = request.args.get("operator", "Operator")
-    categories = {"Consumables": get_dropdown_items("Consumables"), "Raw Material": get_dropdown_items("Raw Material"),
+    categories = {"Consumables": get_dropdown_items("Consumables"), "Raw Material": get_rm_sizes(),
                   "Semi-Finished": get_dropdown_items("Semi-Finished"), "Finished Goods": get_dropdown_items("Finished Goods")}
     return render_template_string(RECEIPT_FORM_HTML, operator=operator, default_time=default_entry_time(),
-                                   categories=list(categories.keys()), category_items=categories)
+                                   categories=list(categories.keys()), category_items=categories, rm_makes=get_rm_makes())
 
 
 @app.route("/submit-receipt", methods=["POST"])
@@ -2959,6 +3103,10 @@ def submit_receipt():
     item = request.form.get("item", "")
     custom_item = request.form.get("custom_item", "").strip()
     final_item = custom_item if item == "Other" and custom_item else item
+    if category == "Raw Material":
+        final_item = rm_compose(final_item, request.form.get("make", ""), request.form.get("custom_make", ""))
+        if "|" not in final_item:
+            return ("Please go back and select the Make of the wire rod before submitting.", 400)
     quantity = safe_float(request.form.get("quantity", ""))
     rate_raw = request.form.get("rate", "")
     rate = safe_float(rate_raw) if rate_raw else None
@@ -3690,6 +3838,7 @@ SALES_FORM_HTML = BASE_STYLE + """
 </div>
 <script>
   var saleCategories = {{ sale_categories | tojson }};
+  var saleMakes = {{ rm_makes | tojson }};
   function consumableUnit(item) { var n = (item || '').toLowerCase(); if (n === 'zinc' || n === 'lead') return 'Ingots'; if (n.indexOf('wrapping') >= 0) return 'Boxes'; if (n.indexOf('charcoal') >= 0 || n.indexOf('charcol') >= 0 || n.indexOf('flux') >= 0) return 'Bags'; return null; }
   function coilLabelFor(cat, item) {
     if (cat === 'Raw Material' || cat === 'Finished Goods') return 'No. of Coils';
@@ -3706,6 +3855,7 @@ SALES_FORM_HTML = BASE_STYLE + """
 
     var catLabel = document.createElement('label'); catLabel.textContent = 'Category';
     var catSelect = document.createElement('select');
+    catSelect.name = 'sale_cat[]';
     saleCategories.forEach(function(pair) {
       var o = document.createElement('option'); o.value = pair[0]; o.textContent = pair[0]; catSelect.appendChild(o);
     });
@@ -3728,6 +3878,30 @@ SALES_FORM_HTML = BASE_STYLE + """
     select.addEventListener('change', function() { customInput.style.display = (select.value === 'Other') ? 'block' : 'none'; });
     catSelect.addEventListener('change', fillItems);
     fillItems();
+
+    var makeBox = document.createElement('div'); makeBox.style.display = 'none';
+    var makeLab = document.createElement('label'); makeLab.textContent = 'Make';
+    var makeSelect = document.createElement('select'); makeSelect.name = 'make[]';
+    var mph = document.createElement('option'); mph.value = ''; mph.textContent = 'Select make'; makeSelect.appendChild(mph);
+    saleMakes.forEach(function(mk) {
+      var mo = document.createElement('option'); mo.value = mk; mo.textContent = mk; makeSelect.appendChild(mo);
+    });
+    var nmo = document.createElement('option'); nmo.value = '__nomake__'; nmo.textContent = 'No make (old stock)'; makeSelect.appendChild(nmo);
+    var omo = document.createElement('option'); omo.value = 'Other'; omo.textContent = 'Other (new make)'; makeSelect.appendChild(omo);
+    var customMake = document.createElement('input');
+    customMake.type = 'text'; customMake.name = 'custom_make[]'; customMake.placeholder = 'Specify make'; customMake.style.display = 'none'; customMake.style.marginTop = '8px';
+    makeBox.appendChild(makeLab); makeBox.appendChild(makeSelect); makeBox.appendChild(customMake);
+    function updateMake() {
+      var isRaw = catSelect.value.indexOf('Raw') === 0;
+      makeBox.style.display = isRaw ? 'block' : 'none';
+      makeSelect.required = isRaw;
+      if (!isRaw) { makeSelect.value = ''; customMake.value = ''; }
+      customMake.style.display = (isRaw && makeSelect.value === 'Other') ? 'block' : 'none';
+      customMake.required = isRaw && makeSelect.value === 'Other';
+    }
+    makeSelect.addEventListener('change', updateMake);
+    catSelect.addEventListener('change', updateMake);
+    updateMake();
 
     var qtyLabel = document.createElement('label'); qtyLabel.textContent = 'Quantity Sold';
     var qtyInput = document.createElement('input');
@@ -3765,6 +3939,7 @@ SALES_FORM_HTML = BASE_STYLE + """
     var itemLabel = document.createElement('label'); itemLabel.textContent = 'Item';
     row.appendChild(catLabel); row.appendChild(catSelect);
     row.appendChild(itemLabel); row.appendChild(select); row.appendChild(customInput);
+    row.appendChild(makeBox);
     row.appendChild(qtyLabel); row.appendChild(qtyInput);
     row.appendChild(coilBox);
     row.appendChild(priceLabel); row.appendChild(priceInput);
@@ -3782,11 +3957,11 @@ def sales_form():
     sale_categories = [
         ["Finished Goods", get_dropdown_items("Finished Goods")],
         ["Semi-Finished (MS Wire / Scrap)", get_dropdown_items("Semi-Finished")],
-        ["Raw Material (Wire Rod)", get_dropdown_items("Raw Material")],
+        ["Raw Material (Wire Rod)", get_rm_sizes()],
         ["Consumables", get_dropdown_items("Consumables")],
     ]
     return render_template_string(SALES_FORM_HTML, operator=operator, default_time=default_entry_time(),
-                                   sale_categories=sale_categories)
+                                   sale_categories=sale_categories, rm_makes=get_rm_makes())
 
 
 @app.route("/submit-sale", methods=["POST"])
@@ -3805,6 +3980,15 @@ def submit_sale():
     coil_values = request.form.getlist("coils[]")
     while len(coil_values) < len(items):
         coil_values.append("")
+    sale_cats = request.form.getlist("sale_cat[]")
+    while len(sale_cats) < len(items):
+        sale_cats.append("")
+    sale_makes = request.form.getlist("make[]")
+    while len(sale_makes) < len(items):
+        sale_makes.append("")
+    sale_cmakes = request.form.getlist("custom_make[]")
+    while len(sale_cmakes) < len(items):
+        sale_cmakes.append("")
 
     batch_id = str(uuid.uuid4())
     conn = get_db_connection()
@@ -3816,15 +4000,19 @@ def submit_sale():
 
     known_for_coils = get_all_known_items()
     line_summaries = []
-    for item, custom, qty_raw, price_raw, coil_raw in zip(items, customs, quantities, prices, coil_values):
+    for item, custom, qty_raw, price_raw, coil_raw, sale_cat, sale_make, sale_cmake in zip(
+            items, customs, quantities, prices, coil_values, sale_cats, sale_makes, sale_cmakes):
         final_item = custom.strip() if item == "Other" and custom.strip() else item
+        if sale_cat.startswith("Raw"):
+            final_item = rm_compose(final_item, sale_make, sale_cmake)
         qty = safe_float(qty_raw)
         price = safe_float(price_raw)
         if not final_item or qty == 0:
             continue
         total_amount = round(qty * price, 2)
         sale_coils = None
-        if final_item in known_for_coils.get("Raw Material", []) or final_item in SEED_ITEMS.get("Raw Material", []):
+        if (sale_cat.startswith("Raw") or final_item in known_for_coils.get("Raw Material", [])
+                or final_item in SEED_ITEMS.get("Raw Material", [])):
             sale_coils = parse_coils(coil_raw)
         elif final_item in known_for_coils.get("Finished Goods", []) or final_item in SEED_ITEMS.get("Finished Goods", []):
             sale_coils = parse_coils(coil_raw)
@@ -7497,12 +7685,16 @@ def opening_stock_admin():
         as_of_date = request.form.get("as_of_date") or now_ist().strftime("%Y-%m-%d")
         conn = get_db_connection()
         cur = conn.cursor()
+        existing_opening = set(get_opening_stock_map().keys())
         for category, items in [("Consumables", set(SEED_ITEMS["Consumables"]) | set(known["Consumables"])),
-                                 ("Raw Material", set(SEED_ITEMS["Raw Material"]) | set(known["Raw Material"])),
+                                 ("Raw Material", get_rm_universe(known)),
                                  ("Semi-Finished", set(SEED_ITEMS["Semi-Finished"]) | set(known["Semi-Finished"])),
                                  ("Finished Goods", set(SEED_ITEMS["Finished Goods"]) | set(known["Finished Goods"]))]:
             for item in items:
                 val = request.form.get(f"qty_{item}")
+                if category == "Raw Material" and "|" in item and item not in existing_opening \
+                        and not safe_float(val or "") and parse_coils(request.form.get(f"coils_{item}", "")) in (None, 0):
+                    continue  # an untouched size x make combination - don't create an empty row
                 value_raw = request.form.get(f"value_{item}", "")
                 value_val = safe_float(value_raw) if value_raw else None
                 if val is not None and is_manager():
@@ -7540,7 +7732,7 @@ def opening_stock_admin():
     opening_values = {r[0]: float(r[1]) if r[1] is not None else None for r in cur.fetchall()}
     cur.close()
     consumables = sorted((i, opening.get(i, 0.0), None) for i in set(SEED_ITEMS["Consumables"]) | set(known["Consumables"]))
-    raw_material = sorted((i, opening.get(i, 0.0), opening_values.get(i)) for i in set(SEED_ITEMS["Raw Material"]) | set(known["Raw Material"]))
+    raw_material = sorted((i, opening.get(i, 0.0), opening_values.get(i)) for i in get_rm_universe(known))
     semi_finished = sorted((i, opening.get(i, 0.0), opening_values.get(i)) for i in set(SEED_ITEMS["Semi-Finished"]) | set(known["Semi-Finished"]))
     finished_goods = sorted((i, opening.get(i, 0.0), None) for i in set(SEED_ITEMS["Finished Goods"]) | set(known["Finished Goods"]))
 
