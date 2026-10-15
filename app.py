@@ -7809,6 +7809,7 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
 
   <form id="moveForm" method="POST" action="/submit-move-old-stock">
     <input type="hidden" name="key" value="{{ admin_key }}">
+    <input type="hidden" name="allow_over" id="allowOver" value="">
     <label>Date &amp; Time</label>
     <input type="datetime-local" name="entry_time" value="{{ default_time }}" required>
 
@@ -7866,7 +7867,7 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
     for (var i = 0; i < kgs.length; i++) { tk += parseFloat(kgs[i].value) || 0; tc += parseInt(cls[i].value) || 0; }
     var line = 'Moving <b>' + fmt(tk) + ' kg, ' + tc + ' coils</b> &mdash; remaining as old stock: <b>' + fmt(b.kg - tk) + ' kg</b>' + (b.coils !== null ? ', <b>' + (b.coils - tc) + ' coils</b>' : '');
     var over = tk > b.kg + 0.01 || (b.coils !== null && b.coils >= 0 && tc > b.coils);
-    document.getElementById('totalLine').innerHTML = line + (over ? ' <span style="color:var(--bad);font-weight:700;">&mdash; more than the old stock!</span>' : '');
+    document.getElementById('totalLine').innerHTML = line + (over ? ' <span style="color:var(--bad);font-weight:700;">&mdash; more than the app shows; old stock will go negative (you will be asked to confirm)</span>' : '');
   }
   document.getElementById('sizeSelect').addEventListener('change', refreshTotals);
   document.getElementById('moveForm').addEventListener('submit', function(e) {
@@ -7881,8 +7882,14 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
     if (!used) { alert('Enter the Qty (Kg) for at least one make.'); e.preventDefault(); return; }
     var b = curBal(), tk = 0, tc = 0;
     for (var j = 0; j < kgs.length; j++) { tk += parseFloat(kgs[j].value) || 0; tc += parseInt(cls[j].value) || 0; }
-    if (tk > b.kg + 0.01) { alert('You are moving more kg than the old stock left.'); e.preventDefault(); return; }
-    if (b.coils !== null && b.coils >= 0 && tc > b.coils) { alert('You are moving more coils than the old stock left.'); e.preventDefault(); return; }
+    var overKg = tk > b.kg + 0.01, overCoils = (b.coils !== null && b.coils >= 0 && tc > b.coils);
+    if (overKg || overCoils) {
+      var msg = 'You are moving more than the old stock shows';
+      if (overKg) { msg += ' (' + fmt(tk - b.kg) + ' kg extra)'; }
+      msg += '.\\nThe old stock will go to ' + fmt(b.kg - tk) + ' kg' + (b.coils !== null ? ' and ' + (b.coils - tc) + ' coils' : '') + ' (negative) until you correct it.\\n\\nMove it anyway?';
+      if (!confirm(msg)) { e.preventDefault(); return; }
+      document.getElementById('allowOver').value = '1';
+    }
     var btn = document.querySelector('#moveForm button.submit'); btn.disabled = true; btn.textContent = 'Saving...';
   });
   addMoveRow();
@@ -7965,11 +7972,11 @@ def submit_move_old_stock():
 
     today = now_ist().strftime("%Y-%m-%d")
     balance = next((r["balance"] for r in compute_stock(today)[1] if r["item"] == size), 0.0)
-    if sum(r[1] for r in rows) > balance + 0.01:
-        return (f"You are moving more than the old stock left ({round(balance, 2)} kg). Please go back and correct it.", 400)
     coil_info = compute_coil_balances(today).get(size)
-    if coil_info is not None and coil_info["balance"] >= 0 and sum(r[2] for r in rows) > coil_info["balance"]:
-        return (f"You are moving more coils than the old stock left ({coil_info['balance']}). Please go back and correct it.", 400)
+    over_kg = sum(r[1] for r in rows) > balance + 0.01
+    over_coils = coil_info is not None and coil_info["balance"] >= 0 and sum(r[2] for r in rows) > coil_info["balance"]
+    if (over_kg or over_coils) and request.form.get("allow_over") != "1":
+        return ("This moves more than the old stock shows, so it was not saved. Please go back and confirm the warning to move it anyway.", 400)
 
     operator = request.form.get("operator") or ("Manager" if is_manager() else "Admin")
     batch_id = str(uuid.uuid4())
