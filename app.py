@@ -1735,6 +1735,19 @@ def compute_coil_balances(date_str):
     return final
 
 
+def hide_settled_old_rm(rows):
+    """Hide an old no-make wire rod line once it is fully settled (0 kg, 0 count)
+    and that size has make lines. Display only - nothing is deleted."""
+    with_make = {rm_base(r["item"]) for r in rows if "|" in r["item"]}
+    out = []
+    for r in rows:
+        if "|" not in r["item"] and r["item"] in with_make and abs(r["balance"]) < 0.005 \
+                and (not r.get("coils") or r["coils"]["balance"] == 0):
+            continue
+        out.append(r)
+    return out
+
+
 def compute_stock(selected_date=None):
     today = now_ist().strftime("%Y-%m-%d")
     date_str = selected_date or today
@@ -4888,6 +4901,7 @@ def render_dashboard(is_admin, selected_date=None, operator_filter=None, report_
     is_today = (date_str == today)
 
     consumables_stock, raw_material_stock, semi_finished_stock, finished_goods_stock, totals = compute_stock(date_str)
+    raw_material_stock = hide_settled_old_rm(raw_material_stock)
 
     low_stock_items = []
     for row in raw_material_stock:
@@ -7827,6 +7841,23 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
     <button class="submit" type="submit">Move Stock</button>
   </form>
 
+  {% if settle %}
+  <h2 class="section" style="margin-top:28px;">Settle old stock to zero</h2>
+  <p class="subtitle">After moving, these old (no-make) lines still show a leftover. This corrects each line's <b>opening</b> so its balance becomes exactly 0 (kg and count). Nothing is deleted; make costs are not affected.</p>
+  <form method="POST" action="/settle-old-stock" onsubmit="return confirm('Correct the opening of the ticked old lines so their balance becomes 0?');">
+    <input type="hidden" name="key" value="{{ admin_key }}">
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Size</th><th>Balance now</th><th>Opening: now &rarr; new</th><th>Count now</th></tr>
+      {% for r in settle %}
+      <tr><td><input type="checkbox" name="size[]" value="{{ r.size }}" checked></td><td>{{ r.size }}</td>
+      <td>{{ r.balance }} kg</td><td>{{ r.opening }} &rarr; <b>{{ r.new_opening }}</b></td>
+      <td>{% if r.coils is not none %}{{ r.coils }} &rarr; 0{% else %}-{% endif %}</td></tr>
+      {% endfor %}
+    </table></div>
+    <button class="submit" type="submit">Settle ticked lines to zero</button>
+  </form>
+  {% endif %}
+
   <h2 class="section" style="margin-top:28px;">Earlier moves</h2>
   {% if not history %}<p style="color:var(--ink-soft);font-size:14px;">No moves yet.</p>{% endif %}
   {% for h in history %}
@@ -7936,7 +7967,68 @@ def move_old_stock():
     history = [batches[k] for k in order[:15]]
 
     return render_template_string(MOVE_OLD_STOCK_HTML, admin_key=active_key(), legacy=legacy, makes=get_rm_makes(),
-                                   default_time=default_entry_time(), history=history, saved=bool(request.args.get("saved")))
+                                   default_time=default_entry_time(), history=history, saved=bool(request.args.get("saved")),
+                                   settle=([] if is_manager() else settle_candidates(today)))
+
+
+def settle_candidates(today):
+    """Old no-make wire rod lines that still show a leftover kg or count, once their size has makes."""
+    rows = compute_stock(today)[1]
+    coil_map = compute_coil_balances(today)
+    with_make = {rm_base(r["item"]) for r in rows if "|" in r["item"]}
+    out = []
+    for r in rows:
+        if "|" in r["item"] or r["item"] not in with_make:
+            continue
+        c = coil_map.get(r["item"])
+        cb = c["balance"] if c else None
+        if abs(r["balance"]) < 0.005 and not cb:
+            continue
+        out.append({"size": r["item"], "balance": round(r["balance"], 2), "opening": round(r["opening"], 2),
+                    "new_opening": round(r["opening"] - r["balance"], 2), "coils": cb})
+    return out
+
+
+@app.route("/settle-old-stock", methods=["POST"])
+def settle_old_stock():
+    if not key_ok(request.form.get("key")):
+        abort(403)
+    today = now_ist().strftime("%Y-%m-%d")
+    chosen = set(request.form.getlist("size[]"))
+    cands = [c for c in settle_candidates(today) if c["size"] in chosen]
+    if not cands:
+        return redirect(f"/move-old-stock?key={active_key()}&saved=1")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT item_name, opening_qty, opening_value FROM opening_stock")
+    stored = {r[0]: (float(r[1]), float(r[2]) if r[2] is not None else None) for r in cur.fetchall()}
+    for c in cands:
+        item, new_qty = c["size"], c["new_opening"]
+        old_qty, old_val = stored.get(item, (0.0, None))
+        # keep the same rate per kg on the opening value
+        new_val = round(old_val * new_qty / old_qty, 2) if (old_val is not None and old_qty > 0 and new_qty >= 0) else old_val
+        cur.execute("""
+            INSERT INTO opening_stock (item_name, category, opening_qty, opening_value, updated_at) VALUES (%s,%s,%s,%s,%s)
+            ON CONFLICT (item_name) DO UPDATE SET opening_qty=EXCLUDED.opening_qty, opening_value=EXCLUDED.opening_value, updated_at=EXCLUDED.updated_at
+        """, (item, "Raw Material", new_qty, new_val, today))
+        if c["coils"]:
+            cur.execute("SELECT coils FROM coil_opening WHERE category=%s AND item_name=%s", ("Raw Material", item))
+            row = cur.fetchone()
+            if row:
+                cur.execute("UPDATE coil_opening SET coils=%s, updated_at=NOW() WHERE category=%s AND item_name=%s",
+                            (int(row[0]) - c["coils"], "Raw Material", item))
+            else:
+                cur.execute("INSERT INTO coil_opening (category, item_name, coils, as_of_date, updated_at) VALUES (%s,%s,%s,%s,NOW())",
+                            ("Raw Material", item, -c["coils"], "2000-01-01"))
+    conn.commit()
+    cur.close()
+    try:
+        resync_opening_stock_sheet()
+    except Exception as e:
+        print(f"  -> Sheets mirror FAILED for OpeningStock: {e}")
+    if is_date_already_closed(today):
+        cascade_reclose_from_date(today)
+    return redirect(f"/move-old-stock?key={active_key()}&saved=1")
 
 
 @app.route("/submit-move-old-stock", methods=["POST"])
