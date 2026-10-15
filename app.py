@@ -649,7 +649,7 @@ def get_all_known_items():
 
     cur.execute("SELECT item_name FROM opening_stock WHERE category='Raw Material'")
     raw_material = set(r[0] for r in cur.fetchall())
-    cur.execute("SELECT DISTINCT item_name FROM line_items WHERE category IN ('wire_rod','receipt_raw_material')")
+    cur.execute("SELECT DISTINCT item_name FROM line_items WHERE category IN ('wire_rod','receipt_raw_material','rm_transfer_in','rm_transfer_out')")
     raw_material |= set(r[0] for r in cur.fetchall())
 
     cur.execute("SELECT item_name FROM opening_stock WHERE category='Semi-Finished'")
@@ -1046,7 +1046,8 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
     safe to show to operators too, same as the stock tables themselves."""
     category_map = {
         "Consumables": [("receipt_consumables", "Received"), ("consumption", "Consumed"), ("sale", "Sold")],
-        "Raw Material": [("receipt_raw_material", "Received"), ("wire_rod", "Issued"), ("sale", "Sold")],
+        "Raw Material": [("receipt_raw_material", "Received"), ("rm_transfer_in", "Moved in"), ("wire_rod", "Issued"),
+                        ("rm_transfer_out", "Moved out"), ("sale", "Sold")],
         "Semi-Finished": [("ms_wire_produced", "Produced"), ("scrap_produced", "Produced"),
                           ("receipt_semi_finished", "Received"), ("ms_wire_consumed", "Issued"), ("sale", "Sold")],
         "Finished Goods": [("production", "Produced"), ("receipt_finished_goods", "Received"), ("sale", "Sold")],
@@ -1062,7 +1063,7 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
             ORDER BY s.entry_date, s.entry_time
         """, (category_db, item_name, from_date, to_date))
         for entry_date, entry_time, operator, qty, coils in cur.fetchall():
-            direction = "in" if label in ("Received", "Produced") else "out"
+            direction = "in" if label in ("Received", "Produced", "Moved in") else "out"
             rows.append({"entry_date": entry_date, "entry_time": entry_time, "operator": operator,
                         "action": label, "quantity": float(qty), "direction": direction,
                         "coils": int(coils) if coils is not None else None})
@@ -1198,6 +1199,13 @@ def compute_raw_material_weighted_avg(month_str):
         GROUP BY li.item_name
     """, (month_str,))
     added = {r[0]: (float(r[1]), float(r[2])) for r in cur.fetchall()}
+    cur.execute("""
+        SELECT li.item_name, COALESCE(SUM(li.quantity),0)
+        FROM line_items li JOIN submissions s ON li.batch_id = s.batch_id
+        WHERE li.category='rm_transfer_in' AND TO_CHAR(s.entry_date,'YYYY-MM')=%s
+        GROUP BY li.item_name
+    """, (month_str,))
+    moved_in = {r[0]: float(r[1]) for r in cur.fetchall()}
     cur.execute("SELECT item_name, opening_qty, opening_value FROM opening_stock WHERE category='Raw Material'")
     opening_rows = {r[0]: (float(r[1] or 0), float(r[2]) if r[2] is not None else None) for r in cur.fetchall()}
     cur.close()
@@ -1209,7 +1217,8 @@ def compute_raw_material_weighted_avg(month_str):
         base_qty = bootstrap_qty if bootstrap_qty else total_open_kg
         bootstrap_rate = (bootstrap_value / base_qty) if base_qty else 0.0
 
-    items = sorted(set(open_balances) | set(close_balances) | set(added))
+    items = sorted(set(open_balances) | set(close_balances) | set(added) | set(moved_in),
+                   key=lambda n: (1 if "|" in n else 0, n))  # old no-make stock first: moved stock takes its rate
     item_rates = {}
     tot = {"open_qty": 0.0, "open_value": 0.0, "added_qty": 0.0, "added_value": 0.0, "close_qty": 0.0, "close_value": 0.0}
     for item in items:
@@ -1231,8 +1240,17 @@ def compute_raw_material_weighted_avg(month_str):
                 open_rate = pooled_prev_rate if pooled_prev_rate is not None else 0.0
         open_value = round(open_qty * open_rate, 2)
 
-        total_qty = open_qty + add_qty
-        total_value = open_value + add_value
+        # Stock moved in from old no-make stock carries that old stock's cost. It is not
+        # a purchase, so it is kept out of the added_* totals; the matching reduction
+        # sits in the old line's closing stock, so the totals cancel exactly.
+        move_qty = moved_in.get(item, 0.0)
+        move_rate = item_rates.get(rm_base(item)) if move_qty else None
+        if move_qty and move_rate is None:
+            move_rate = get_rate_as_of_date(rm_base(item), last_day) or pooled_prev_rate or 0.0
+        move_value = round(move_qty * (move_rate or 0.0), 2)
+
+        total_qty = open_qty + add_qty + move_qty
+        total_value = open_value + add_value + move_value
         if total_qty > 0 and total_value > 0:
             rate = round(total_value / total_qty, 4)
         else:
@@ -1627,8 +1645,11 @@ def compute_in_out_for_date(category_label, item_name, date_str):
                 sum_qty_for_date("consumption", item_name, date_str) + sales_map.get(item_name, 0.0))
     elif category_label == "Raw Material":
         sales_map, _, _ = get_sales_summary_for_date(date_str)
-        out_amt = sum_qty_for_date("wire_rod", item_name, date_str) + sales_map.get(item_name, 0.0)
-        return sum_qty_for_date("receipt_raw_material", item_name, date_str), out_amt
+        out_amt = (sum_qty_for_date("wire_rod", item_name, date_str) + sales_map.get(item_name, 0.0)
+                   + sum_qty_for_date("rm_transfer_out", item_name, date_str))
+        in_amt = (sum_qty_for_date("receipt_raw_material", item_name, date_str)
+                  + sum_qty_for_date("rm_transfer_in", item_name, date_str))
+        return in_amt, out_amt
     elif category_label == "Semi-Finished":
         sales_map, _, _ = get_sales_summary_for_date(date_str)
         in_amt = (sum_qty_for_date("receipt_semi_finished", item_name, date_str)
@@ -1655,8 +1676,8 @@ def get_coil_opening_map():
     return result
 
 
-COIL_IN_CATEGORIES = ("receipt_raw_material", "production", "receipt_finished_goods", "receipt_consumables")
-COIL_OUT_CATEGORIES = ("wire_rod", "sale", "consumption")
+COIL_IN_CATEGORIES = ("receipt_raw_material", "production", "receipt_finished_goods", "receipt_consumables", "rm_transfer_in")
+COIL_OUT_CATEGORIES = ("wire_rod", "sale", "consumption", "rm_transfer_out")
 
 
 @request_cache
@@ -1755,9 +1776,12 @@ def compute_stock(selected_date=None):
             out_map = {i: consumed_map.get(i, 0.0) + sales_map.get(i, 0.0) for i in items}
         elif category_label == "Raw Material":
             sales_map, _, _ = get_sales_summary_for_date(date_str)
-            in_map = sum_qty_by_item_for_date("receipt_raw_material", date_str)
+            receipts_rm_map = sum_qty_by_item_for_date("receipt_raw_material", date_str)
+            moved_in_map = sum_qty_by_item_for_date("rm_transfer_in", date_str)
+            in_map = {i: receipts_rm_map.get(i, 0.0) + moved_in_map.get(i, 0.0) for i in items}
             wire_rod_out_map = sum_qty_by_item_for_date("wire_rod", date_str)
-            out_map = {i: wire_rod_out_map.get(i, 0.0) + sales_map.get(i, 0.0) for i in items}
+            moved_out_map = sum_qty_by_item_for_date("rm_transfer_out", date_str)
+            out_map = {i: wire_rod_out_map.get(i, 0.0) + sales_map.get(i, 0.0) + moved_out_map.get(i, 0.0) for i in items}
         elif category_label == "Semi-Finished":
             sales_map, _, _ = get_sales_summary_for_date(date_str)
             receipts_map = sum_qty_by_item_for_date("receipt_semi_finished", date_str)
@@ -2192,7 +2216,7 @@ MANAGER_ALLOWED_PATHS = {
     "/edit-entry", "/save-edit", "/delete-entry", "/confirm-delete",
     "/bulk-delete-readings", "/bulk-delete-line-items", "/delete-submission", "/confirm-delete-submission",
     "/item-detail", "/day-detail", "/production-analysis", "/furnace-analysis",
-    "/check-duplicates", "/opening-stock",
+    "/check-duplicates", "/opening-stock", "/move-old-stock", "/submit-move-old-stock",
     "/spares-form", "/submit-spares", "/breakdown-form", "/submit-breakdown",
     "/resolve-breakdown", "/confirm-resolve-breakdown", "/preventive-maintenance",
     "/add-preventive-schedule", "/mark-preventive-done",
@@ -4255,6 +4279,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     <a class="side-link" href="/production-analysis?key={{ admin_key }}">&#128230; Production Analysis</a>
     {% if not hide_money %}<a class="side-link" href="/sales-analysis?key={{ admin_key }}">&#128176; Sales Analysis</a>{% endif %}
     <a class="side-link" href="/opening-stock?key={{ admin_key }}">&#128230; Opening Stock</a>
+    <a class="side-link" href="/move-old-stock?key={{ admin_key }}">&#128260; Move Old Stock to Makes</a>
     {% if not hide_money %}<a class="side-link" href="/set-opening-value?key={{ admin_key }}">&#128176; Opening Value (P&amp;L)</a>{% endif %}
     {% if not hide_money %}<a class="side-link" href="/set-semi-finished-stock?key={{ admin_key }}">&#128230; MS Wire / Scrap Stock</a>{% endif %}
     {% if not hide_money %}<a class="side-link" href="/maintenance-dashboard?key={{ admin_key }}">&#128736; Maintenance</a>{% endif %}
@@ -5024,8 +5049,23 @@ EDIT_FORM_HTML = BASE_STYLE + """
     <input type="hidden" name="row_id" value="{{ row_id }}">
     <input type="hidden" name="key" value="{{ admin_key }}">
     {% for col_name, value in fields %}
+    {% if col_name == 'item_name' and rm_edit %}
+    <label>Size</label>
+    <select id="rmSize">{% for sz in rm_edit.sizes %}<option value="{{ sz }}" {{ 'selected' if sz == rm_edit.cur_size else '' }}>{{ sz }}</option>{% endfor %}</select>
+    <label>Make</label>
+    <select id="rmMake"><option value="">No make (old stock)</option>{% for mk in rm_edit.makes %}<option value="{{ mk }}" {{ 'selected' if mk == rm_edit.cur_make else '' }}>{{ mk }}</option>{% endfor %}</select>
+    <input type="hidden" name="col_item_name" id="rmItem" value="{{ value }}">
+    <script>
+      (function() {
+        var sz = document.getElementById('rmSize'), mk = document.getElementById('rmMake'), out = document.getElementById('rmItem');
+        function upd() { out.value = mk.value ? (sz.value + ' | ' + mk.value) : sz.value; }
+        sz.addEventListener('change', upd); mk.addEventListener('change', upd);
+      })();
+    </script>
+    {% else %}
     <label>{{ col_name }}{{ ' *' if col_name in protected_columns else '' }}</label>
     <input type="text" name="col_{{ col_name }}" value="{{ value if value is not none else '' }}" {{ 'required' if col_name in protected_columns else '' }}>
+    {% endif %}
     {% endfor %}
     {% if protected_columns %}<p style="font-size:12px;color:var(--ink-soft);">* Required field &mdash; can't be left blank</p>{% endif %}
     <button class="submit" type="submit">Save Changes</button>
@@ -5079,6 +5119,7 @@ def edit_entry():
     if table not in ("readings", "line_items") or not row_id:
         abort(400)
 
+    rm_edit = None
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -5108,8 +5149,20 @@ def edit_entry():
         fields = list(zip(sub_columns, sub_row)) + list(zip(LINE_ITEMS_COLUMNS, item_values))
         protected = NOT_NULL_COLUMNS["line_items"] | NOT_NULL_SUBMISSION_COLUMNS
 
+        # Wire rod entries get Size + Make dropdowns instead of a free-text item box
+        cur_item = item_values[0]
+        sizes_now = get_rm_sizes()
+        if category in ("receipt_raw_material", "wire_rod") or rm_base(cur_item) in sizes_now:
+            if category not in ("rm_transfer_in", "rm_transfer_out"):
+                sizes_list = sizes_now if rm_base(cur_item) in sizes_now else sizes_now + [rm_base(cur_item)]
+                makes_list = get_rm_makes()
+                if rm_make_of(cur_item) and rm_make_of(cur_item) not in makes_list:
+                    makes_list = makes_list + [rm_make_of(cur_item)]
+                rm_edit = {"sizes": sizes_list, "makes": makes_list,
+                           "cur_size": rm_base(cur_item), "cur_make": rm_make_of(cur_item)}
+
     return render_template_string(EDIT_FORM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key(),
-                                   protected_columns=protected)
+                                   protected_columns=protected, rm_edit=rm_edit)
 
 
 @app.route("/save-edit", methods=["POST"])
@@ -5287,7 +5340,7 @@ DELETE_SUBMISSION_CONFIRM_HTML = BASE_STYLE + """
     <input type="hidden" name="from_date" value="{{ from_date }}">
     <input type="hidden" name="to_date" value="{{ to_date }}">
     <div style="display:flex;gap:10px;margin-top:10px;">
-      <a href="{% if back == 'dup' %}/check-duplicates?key={{ admin_key }}&from_date={{ from_date }}&to_date={{ to_date }}{% else %}/dashboard?key={{ admin_key }}{% endif %}" style="flex:1;text-align:center;padding:15px 0;background:var(--ink);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;">Cancel</a>
+      <a href="{% if back == 'dup' %}/check-duplicates?key={{ admin_key }}&from_date={{ from_date }}&to_date={{ to_date }}{% elif back == 'move' %}/move-old-stock?key={{ admin_key }}{% else %}/dashboard?key={{ admin_key }}{% endif %}" style="flex:1;text-align:center;padding:15px 0;background:var(--ink);color:white;border-radius:8px;text-decoration:none;font-weight:700;text-transform:uppercase;">Cancel</a>
       <button type="submit" style="flex:1;padding:15px 0;background:var(--bad);color:white;border:none;border-radius:8px;font-weight:700;text-transform:uppercase;cursor:pointer;">Yes, Delete All {{ items|length }} Items</button>
     </div>
   </form>
@@ -5401,7 +5454,9 @@ def confirm_delete_submission():
 
     resync_sheet_for_table("line_items")
 
-    if request.form.get("back") == "dup":
+    if request.form.get("back") == "move":
+        dest = f"/move-old-stock?key={active_key()}"
+    elif request.form.get("back") == "dup":
         dest = (f"/check-duplicates?key={active_key()}&from_date={quote(request.form.get('from_date', ''))}"
                 f"&to_date={quote(request.form.get('to_date', ''))}")
     else:
@@ -7740,6 +7795,201 @@ def opening_stock_admin():
     return render_template_string(OPENING_STOCK_HTML, admin_key=active_key(), today=now_ist().strftime("%Y-%m-%d"),
                                    consumables=consumables, raw_material=raw_material, semi_finished=semi_finished, finished_goods=finished_goods,
                                    coil_open=coil_open, hide_money=is_manager())
+
+
+# ---------- Move old (no-make) wire rod stock to makes ----------
+# Re-labels existing stock - NOT a purchase and NOT consumption. Each move writes a
+# matching pair of entries (out of the old size, into "size | make") in one
+# submission, so stock, coil counts and the P&L stay exactly right.
+MOVE_OLD_STOCK_HTML = BASE_STYLE + """
+<div class="card wide">
+  <h1>Move Old Stock to Makes</h1>
+  <p class="subtitle">Wire rod stock entered before makes existed has no make. Split it across the real makes here. This only re-labels stock - it is not a purchase and not consumption.</p>
+  {% if saved %}<div class="alert-panel all-clear"><div class="alert-title">&#9989; Saved. The stock below is updated.</div></div>{% endif %}
+
+  <form id="moveForm" method="POST" action="/submit-move-old-stock">
+    <input type="hidden" name="key" value="{{ admin_key }}">
+    <label>Date &amp; Time</label>
+    <input type="datetime-local" name="entry_time" value="{{ default_time }}" required>
+
+    <label>Old stock size (no make)</label>
+    <select id="sizeSelect" name="size">
+      {% for sz in legacy %}<option value="{{ sz }}">{{ sz }}</option>{% endfor %}
+    </select>
+    <p id="balanceLine" style="font-size:14px;margin:6px 0 12px;"></p>
+
+    <h2 class="section">Split across makes</h2>
+    <div id="moveRows"></div>
+    <button class="add-item" type="button" onclick="addMoveRow()">+ Add another make</button>
+    <p id="totalLine" style="font-size:14px;margin:12px 0;"></p>
+
+    <button class="submit" type="submit">Move Stock</button>
+  </form>
+
+  <h2 class="section" style="margin-top:28px;">Earlier moves</h2>
+  {% if not history %}<p style="color:var(--ink-soft);font-size:14px;">No moves yet.</p>{% endif %}
+  {% for h in history %}
+  <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:8px;">
+    <div style="font-size:13px;color:var(--ink-soft);">{{ h.date }} {{ h.time }} &mdash; {{ h.operator }} &mdash; from <b>{{ h.source }}</b></div>
+    {% for t in h.targets %}<div style="font-size:14px;">{{ t.item }}: <b>{{ t.qty }} kg</b>{% if t.coils is not none %} ({{ t.coils }} {{ 'coils' }}){% endif %}</div>{% endfor %}
+    <a href="/delete-submission?batch_id={{ h.batch_id }}&key={{ admin_key }}&back=move" style="color:var(--bad);font-size:13px;font-weight:700;">Undo this move</a>
+  </div>
+  {% endfor %}
+</div>
+<script>
+  var legacyBal = {{ legacy | tojson }};
+  var moveMakes = {{ makes | tojson }};
+  var rowCount = 0;
+  function fmt(n) { return (Math.round(n * 100) / 100).toLocaleString('en-IN'); }
+  function addMoveRow() {
+    rowCount++;
+    var row = document.createElement('div'); row.className = 'extra-row';
+    var ms = document.createElement('select'); ms.name = 'make[]';
+    var ph = document.createElement('option'); ph.value = ''; ph.textContent = 'Select make'; ms.appendChild(ph);
+    moveMakes.forEach(function(mk) { var o = document.createElement('option'); o.value = mk; o.textContent = mk; ms.appendChild(o); });
+    var oo = document.createElement('option'); oo.value = 'Other'; oo.textContent = 'Other (new make)'; ms.appendChild(oo);
+    var cm = document.createElement('input'); cm.type = 'text'; cm.name = 'custom_make[]'; cm.placeholder = 'Specify make'; cm.style.display = 'none';
+    ms.addEventListener('change', function() { cm.style.display = (ms.value === 'Other') ? 'block' : 'none'; });
+    var kg = document.createElement('input'); kg.type = 'number'; kg.name = 'kg[]'; kg.step = 'any'; kg.min = '0'; kg.placeholder = 'Qty (Kg)';
+    var cl = document.createElement('input'); cl.type = 'number'; cl.name = 'coils[]'; cl.step = '1'; cl.min = '0'; cl.placeholder = 'No. of Coils';
+    cl.setAttribute('inputmode', 'numeric');
+    kg.addEventListener('input', refreshTotals); cl.addEventListener('input', refreshTotals);
+    row.appendChild(ms); row.appendChild(cm); row.appendChild(kg); row.appendChild(cl);
+    document.getElementById('moveRows').appendChild(row);
+    refreshTotals();
+  }
+  function curBal() { return legacyBal[document.getElementById('sizeSelect').value] || {kg: 0, coils: null}; }
+  function refreshTotals() {
+    var b = curBal();
+    document.getElementById('balanceLine').innerHTML = 'Old stock left: <b>' + fmt(b.kg) + ' kg</b>' + (b.coils !== null ? ', <b>' + b.coils + ' coils</b>' : '');
+    var kgs = document.getElementsByName('kg[]'), cls = document.getElementsByName('coils[]'), tk = 0, tc = 0;
+    for (var i = 0; i < kgs.length; i++) { tk += parseFloat(kgs[i].value) || 0; tc += parseInt(cls[i].value) || 0; }
+    var line = 'Moving <b>' + fmt(tk) + ' kg, ' + tc + ' coils</b> &mdash; remaining as old stock: <b>' + fmt(b.kg - tk) + ' kg</b>' + (b.coils !== null ? ', <b>' + (b.coils - tc) + ' coils</b>' : '');
+    var over = tk > b.kg + 0.01 || (b.coils !== null && b.coils >= 0 && tc > b.coils);
+    document.getElementById('totalLine').innerHTML = line + (over ? ' <span style="color:var(--bad);font-weight:700;">&mdash; more than the old stock!</span>' : '');
+  }
+  document.getElementById('sizeSelect').addEventListener('change', refreshTotals);
+  document.getElementById('moveForm').addEventListener('submit', function(e) {
+    var makes = document.getElementsByName('make[]'), customs = document.getElementsByName('custom_make[]');
+    var kgs = document.getElementsByName('kg[]'), cls = document.getElementsByName('coils[]'), used = 0;
+    for (var i = 0; i < kgs.length; i++) {
+      if (!kgs[i].value) continue;
+      used++;
+      if (!makes[i].value || (makes[i].value === 'Other' && !customs[i].value.trim())) { alert('Please select the Make in every row.'); e.preventDefault(); return; }
+      if (cls[i].value === '') { alert('Please enter the No. of Coils in every row.'); e.preventDefault(); return; }
+    }
+    if (!used) { alert('Enter the Qty (Kg) for at least one make.'); e.preventDefault(); return; }
+    var b = curBal(), tk = 0, tc = 0;
+    for (var j = 0; j < kgs.length; j++) { tk += parseFloat(kgs[j].value) || 0; tc += parseInt(cls[j].value) || 0; }
+    if (tk > b.kg + 0.01) { alert('You are moving more kg than the old stock left.'); e.preventDefault(); return; }
+    if (b.coils !== null && b.coils >= 0 && tc > b.coils) { alert('You are moving more coils than the old stock left.'); e.preventDefault(); return; }
+    var btn = document.querySelector('#moveForm button.submit'); btn.disabled = true; btn.textContent = 'Saving...';
+  });
+  addMoveRow();
+  refreshTotals();
+</script>
+"""
+
+
+@app.route("/move-old-stock", methods=["GET"])
+def move_old_stock():
+    if not key_ok(request.args.get("key")):
+        abort(403)
+    today = now_ist().strftime("%Y-%m-%d")
+    coil_map = compute_coil_balances(today)
+    legacy = {}
+    for row in compute_stock(today)[1]:
+        if "|" in row["item"]:
+            continue
+        c = coil_map.get(row["item"])
+        legacy[row["item"]] = {"kg": row["balance"], "coils": c["balance"] if c else None}
+    if not legacy:
+        for sz in get_rm_sizes():
+            legacy[sz] = {"kg": 0.0, "coils": None}
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.batch_id, s.entry_date, s.entry_time, s.operator, li.category, li.item_name, li.quantity, li.coils
+        FROM submissions s JOIN line_items li ON li.batch_id = s.batch_id
+        WHERE s.form_type='rm_transfer' ORDER BY s.entry_date DESC, s.entry_time DESC, li.id
+    """)
+    batches = {}
+    order = []
+    for batch_id, d, t, op, cat, item, qty, coils in cur.fetchall():
+        key = str(batch_id)
+        if key not in batches:
+            batches[key] = {"batch_id": key, "date": str(d), "time": str(t)[:5], "operator": op, "source": "", "targets": []}
+            order.append(key)
+        if cat == "rm_transfer_out":
+            batches[key]["source"] = item
+        else:
+            batches[key]["targets"].append({"item": item, "qty": round(float(qty), 2), "coils": int(coils) if coils is not None else None})
+    cur.close()
+    history = [batches[k] for k in order[:15]]
+
+    return render_template_string(MOVE_OLD_STOCK_HTML, admin_key=active_key(), legacy=legacy, makes=get_rm_makes(),
+                                   default_time=default_entry_time(), history=history, saved=bool(request.args.get("saved")))
+
+
+@app.route("/submit-move-old-stock", methods=["POST"])
+def submit_move_old_stock():
+    if not key_ok(request.form.get("key")):
+        abort(403)
+    date_str, time_str = parse_entry_datetime(request.form)
+    size = request.form.get("size", "").strip()
+    if not size or "|" in size:
+        return ("Please go back and choose the old stock size.", 400)
+
+    def padded(name, n):
+        vals = request.form.getlist(name)
+        return vals + [""] * (n - len(vals))
+    makes = request.form.getlist("make[]")
+    n = len(makes)
+    cmakes, kgs, coil_vals = padded("custom_make[]", n), padded("kg[]", n), padded("coils[]", n)
+
+    rows = []
+    for mk, cmk, kg, cl in zip(makes, cmakes, kgs, coil_vals):
+        qty = safe_float(kg)
+        if qty <= 0:
+            continue
+        target = rm_compose(size, mk, cmk)
+        if "|" not in target:
+            return ("Please go back and select the Make in every row.", 400)
+        coils = parse_coils(cl)
+        if coils is None:
+            return ("Please go back and enter the No. of Coils in every row.", 400)
+        rows.append((target, qty, coils))
+    if not rows:
+        return ("Please go back and enter the Qty (Kg) for at least one make.", 400)
+
+    today = now_ist().strftime("%Y-%m-%d")
+    balance = next((r["balance"] for r in compute_stock(today)[1] if r["item"] == size), 0.0)
+    if sum(r[1] for r in rows) > balance + 0.01:
+        return (f"You are moving more than the old stock left ({round(balance, 2)} kg). Please go back and correct it.", 400)
+    coil_info = compute_coil_balances(today).get(size)
+    if coil_info is not None and coil_info["balance"] >= 0 and sum(r[2] for r in rows) > coil_info["balance"]:
+        return (f"You are moving more coils than the old stock left ({coil_info['balance']}). Please go back and correct it.", 400)
+
+    operator = request.form.get("operator") or ("Manager" if is_manager() else "Admin")
+    batch_id = str(uuid.uuid4())
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO submissions (batch_id, form_type, entry_date, entry_time, operator) VALUES (%s,%s,%s,%s,%s)",
+        (batch_id, "rm_transfer", date_str, time_str, operator),
+    )
+    for target, qty, coils in rows:
+        cur.execute("INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                    (batch_id, "rm_transfer_out", size, qty, coils))
+        cur.execute("INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                    (batch_id, "rm_transfer_in", target, qty, coils))
+    conn.commit()
+    cur.close()
+
+    if is_date_already_closed(date_str):
+        cascade_reclose_from_date(date_str)
+    return redirect(f"/move-old-stock?key={active_key()}&saved=1")
 
 
 # ---------- Manual test trigger ----------
