@@ -2423,7 +2423,7 @@ PRODUCTION_FORM_HTML = BASE_STYLE + """
       var item = selectEl.value === 'Other' ? customEl.value.trim() : selectEl.value;
       var label = null;
       if (coilKind === 'fg') { label = 'No. of Coils'; }
-      else if (coilKind === 'cons' && (item === 'Zinc' || item === 'Lead')) { label = 'No. of Ingots'; }
+      else if (coilKind === 'cons') { function consumableUnit(item) { var n = (item || '').toLowerCase(); if (n === 'zinc' || n === 'lead') return 'Ingots'; if (n.indexOf('wrapping') >= 0) return 'Boxes'; if (n.indexOf('charcoal') >= 0 || n.indexOf('charcol') >= 0 || n.indexOf('flux') >= 0) return 'Bags'; return null; } var cu = consumableUnit(item); if (cu) { label = 'No. of ' + cu; } }
       coilBox.style.display = label ? 'block' : 'none';
       coilInput.required = !!label && qtyEl.value !== '';
       if (!label) { coilInput.value = ''; } else { coilLabel.textContent = label; }
@@ -2504,7 +2504,7 @@ def submit_production():
             cur.execute(
                 "INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
                 (batch_id_cons, "consumption", final_item, q,
-                 parse_coils(coil_raw) if final_item in COIL_CONSUMABLES else None),
+                 parse_coils(coil_raw) if consumable_count_unit(final_item) else None),
             )
 
     # Production submission
@@ -2812,15 +2812,37 @@ def submit_electricity():
 # Raw Material (wire rod) and Finished Goods are counted in COILS; Zinc and Lead
 # in INGOTS. MS Wire and Scrap are deliberately not counted. Counts never touch
 # costing or the P&L - they exist only to cross-check physical stock.
-COIL_CONSUMABLES = {"Zinc", "Lead"}
+def consumable_count_unit(item_name):
+    """Counting unit for a consumable, in the owner's own words, or None when the
+    item is not counted (Coal, FO, anything else). Matching is by name so a custom
+    entry like 'Stretch Wrapping Film' is recognised."""
+    n = (item_name or "").strip().lower()
+    if n in ("zinc", "lead"):
+        return "Ingots"
+    if "wrapping" in n:
+        return "Boxes"
+    if "charcoal" in n or "charcol" in n or "flux" in n:
+        return "Bags"
+    return None
+
+
+def unit_of(item_name):
+    """Lower-case unit word for any counted item (consumable unit, else coils)."""
+    u = consumable_count_unit(item_name)
+    return u.lower() if u else "coils"
+
+
+app.jinja_env.globals["unit_of"] = unit_of
+app.jinja_env.globals["consumable_count_unit"] = consumable_count_unit
 
 COIL_JS = """
+  %s
   function coilLabelFor(cat, item) {
     if (cat === 'Raw Material' || cat === 'Finished Goods') return 'No. of Coils';
-    if (cat === 'Consumables' && (item === 'Zinc' || item === 'Lead')) return 'No. of Ingots';
+    if (cat === 'Consumables') { var cu = consumableUnit(item); return cu ? 'No. of ' + cu : null; }
     return null;
   }
-"""
+""" % """function consumableUnit(item) { var n = (item || '').toLowerCase(); if (n === 'zinc' || n === 'lead') return 'Ingots'; if (n.indexOf('wrapping') >= 0) return 'Boxes'; if (n.indexOf('charcoal') >= 0 || n.indexOf('charcol') >= 0 || n.indexOf('flux') >= 0) return 'Bags'; return null; }"""
 
 
 def parse_coils(raw):
@@ -2838,11 +2860,11 @@ def parse_coils(raw):
 def tracks_coils(category_label, item_name):
     if category_label in ("Raw Material", "Finished Goods"):
         return True
-    return category_label == "Consumables" and item_name in COIL_CONSUMABLES
+    return category_label == "Consumables" and consumable_count_unit(item_name) is not None
 
 
 def coil_unit_label(category_label, item_name):
-    return "ingots" if category_label == "Consumables" else "coils"
+    return unit_of(item_name) if category_label == "Consumables" else "coils"
 
 # ---------- Stock: Receipts ----------
 RECEIPT_FORM_HTML = BASE_STYLE + """
@@ -3668,9 +3690,10 @@ SALES_FORM_HTML = BASE_STYLE + """
 </div>
 <script>
   var saleCategories = {{ sale_categories | tojson }};
+  function consumableUnit(item) { var n = (item || '').toLowerCase(); if (n === 'zinc' || n === 'lead') return 'Ingots'; if (n.indexOf('wrapping') >= 0) return 'Boxes'; if (n.indexOf('charcoal') >= 0 || n.indexOf('charcol') >= 0 || n.indexOf('flux') >= 0) return 'Bags'; return null; }
   function coilLabelFor(cat, item) {
     if (cat === 'Raw Material' || cat === 'Finished Goods') return 'No. of Coils';
-    if (cat === 'Consumables' && (item === 'Zinc' || item === 'Lead')) return 'No. of Ingots';
+    if (cat === 'Consumables') { var cu = consumableUnit(item); return cu ? 'No. of ' + cu : null; }
     return null;
   }
   function addSaleItemRow() {
@@ -3805,7 +3828,7 @@ def submit_sale():
             sale_coils = parse_coils(coil_raw)
         elif final_item in known_for_coils.get("Finished Goods", []) or final_item in SEED_ITEMS.get("Finished Goods", []):
             sale_coils = parse_coils(coil_raw)
-        elif final_item in COIL_CONSUMABLES:
+        elif consumable_count_unit(final_item):
             sale_coils = parse_coils(coil_raw)
         cur.execute(
             "INSERT INTO line_items (batch_id, category, item_name, quantity, price, total_amount, coils) VALUES (%s,%s,%s,%s,%s,%s,%s)",
@@ -4210,7 +4233,7 @@ DASHBOARD_HTML = BASE_STYLE + """
 
   <div id="table-raw" class="cat-block">
     <div class="cat-total-row"><span>Total Raw Material Balance</span><span class="cat-total-value">{{ totals.raw_material }}</span></div>
-    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th><th>Count</th></tr>
     {% for row in raw_material_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Raw+Material" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
@@ -4222,13 +4245,13 @@ DASHBOARD_HTML = BASE_STYLE + """
   </div>
   <div id="table-finished" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Finished Goods Balance</span><span class="cat-total-value">{{ totals.finished_goods }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th><th>Count</th></tr>
     {% for row in finished_goods_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Finished+Goods" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
   <div id="table-consumables" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Consumables Balance</span><span class="cat-total-value">{{ totals.consumables }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th><th>Coils / Ingots</th></tr>
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th><th>Count</th></tr>
     {% for row in consumables_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Consumables" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
     </table></div>
   </div>
@@ -4367,7 +4390,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in production_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4376,7 +4399,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4391,7 +4414,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in consumption_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4400,7 +4423,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4415,7 +4438,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
         {% for r in electricity_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4424,7 +4447,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th></tr>
-        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4439,7 +4462,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th><th>Edit</th></tr>
         {% for r in receipts_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4448,7 +4471,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th></tr>
-        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
+        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4464,7 +4487,7 @@ DASHBOARD_HTML = BASE_STYLE + """
       <table>
         <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th><th>Edit</th></tr>
         {% for r in sales_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4473,7 +4496,7 @@ DASHBOARD_HTML = BASE_STYLE + """
     {% else %}
       <table>
         <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th></tr>
-        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
+        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -5211,12 +5234,12 @@ OPENING_STOCK_HTML = BASE_STYLE + """
       Enter the stock as it was at the start of this date - not including that day's own production/sales.
       The system automatically adds/subtracts everything already logged for that date onward.
     </p>
-    <p style="font-size:12px;color:var(--ink-soft);">Coil / ingot counts: enter the PHYSICAL count at the start of the date above. From that date onward the system adds every coil received/produced and subtracts every coil issued/sold. Leave blank to keep the existing count.</p>
+    <p style="font-size:12px;color:var(--ink-soft);">Counts (Coils / Ingots / Boxes / Bags as labelled): enter the PHYSICAL count at the start of the date above. From that date onward the system adds every coil received/produced and subtracts every coil issued/sold. Leave blank to keep the existing count.</p>
     <h2 class="section">Consumables</h2>
     {% for item, qty, value in consumables %}
     <label>{{ item }} - Qty</label><input type="number" step="any" name="qty_{{ item }}" value="{{ qty }}">
-    {% if item in coil_consumables %}
-    <label>{{ item }} - No. of Ingots</label><input type="number" step="1" min="0" name="coils_{{ item }}" value="{{ coil_open.get(item, '') }}">
+    {% if consumable_count_unit(item) %}
+    <label>{{ item }} - No. of {{ consumable_count_unit(item) }}</label><input type="number" step="1" min="0" name="coils_{{ item }}" value="{{ coil_open.get(item, '') }}">
     {% endif %}
     {% endfor %}
     <h2 class="section">Raw Material</h2>
@@ -5924,7 +5947,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Production</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not production_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5933,7 +5956,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Consumption</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not consumption_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5942,7 +5965,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Electricity &amp; Wire Rod</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not electricity_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5951,7 +5974,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Receipts</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td></tr>{% endfor %}
+    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
     {% if not receipts_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -5960,7 +5983,7 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   <h2 class="section">Sales</h2>
   <div class="table-wrap"><table>
     <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Revenue</th></tr>
-    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ingots' if r[5] in ('Zinc','Lead') else ' coils' }})</small>{% endif %}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
+    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
     {% if not sales_rows %}<tr><td colspan="5" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -7524,7 +7547,7 @@ def opening_stock_admin():
     coil_open = {k[1]: v[0] for k, v in get_coil_opening_map().items()}
     return render_template_string(OPENING_STOCK_HTML, admin_key=active_key(), today=now_ist().strftime("%Y-%m-%d"),
                                    consumables=consumables, raw_material=raw_material, semi_finished=semi_finished, finished_goods=finished_goods,
-                                   coil_open=coil_open, coil_consumables=sorted(COIL_CONSUMABLES), hide_money=is_manager())
+                                   coil_open=coil_open, hide_money=is_manager())
 
 
 # ---------- Manual test trigger ----------
