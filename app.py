@@ -2828,7 +2828,8 @@ ELECTRICITY_FORM_HTML = BASE_STYLE + """
       if (wrCoils[i].value === '') { alert('Please enter the No. of Coils for every Wire Rod entry.'); wrCoils[i].focus(); return; }
       var sizeLabel = (sizes[i].value === 'Other' && customs[i].value) ? customs[i].value : sizes[i].value;
       var makeLabel = wrMakes[i].value === 'Other' ? wrCustomMakes[i].value.trim() : (wrMakes[i].value === '__nomake__' ? 'No make (old stock)' : wrMakes[i].value);
-      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + ' | ' + makeLabel + '</span><b>' + qty + ' Kg (' + wrCoils[i].value + ' coils)</b></div>';
+      rows += '<div class="review-row"><span>Wire Rod - ' + sizeLabel + ' | ' + makeLabel + '</span><b>' + qty + ' Kg</b></div>';
+      rows += '<div class="review-row"><span>No. of Coils</span><b>' + wrCoils[i].value + '</b></div>';
       totalMsWire += parseFloat(qty) * conversionFactor;
     }
     if (totalMsWire > 0) {
@@ -4459,8 +4460,8 @@ DASHBOARD_HTML = BASE_STYLE + """
 
   <div id="table-raw" class="cat-block">
     <div class="cat-total-row"><span>Total Raw Material Balance</span><span class="cat-total-value">{{ totals.raw_material }}</span></div>
-    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th><th>Count</th></tr>
-    {% for row in raw_material_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Raw+Material" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Size</th><th>Opening</th><th>Received</th><th>Issued</th><th>Balance</th><th>Count Balance</th><th>Count In</th><th>Count Out</th><th>Kg per Count</th></tr>
+    {% for row in raw_material_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Raw+Material" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td>{% if row.coils %}<td><b>{{ row.coils.balance }}</b> {{ row.coil_unit|capitalize }}</td><td>{{ row.coils.in }}</td><td>{{ row.coils.out }}</td><td>{{ row.kg_per_coil if row.kg_per_coil else '-' }}</td>{% else %}<td>-</td><td>-</td><td>-</td><td>-</td>{% endif %}</tr>{% endfor %}
     </table></div>
   </div>
   <div id="table-semifinished" class="cat-block" style="display:none;">
@@ -4471,14 +4472,14 @@ DASHBOARD_HTML = BASE_STYLE + """
   </div>
   <div id="table-finished" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Finished Goods Balance</span><span class="cat-total-value">{{ totals.finished_goods }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th><th>Count</th></tr>
-    {% for row in finished_goods_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Finished+Goods" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Produced</th><th>Sold</th><th>Balance</th><th>Count Balance</th><th>Count In</th><th>Count Out</th><th>Kg per Count</th></tr>
+    {% for row in finished_goods_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Finished+Goods" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td>{% if row.coils %}<td><b>{{ row.coils.balance }}</b> {{ row.coil_unit|capitalize }}</td><td>{{ row.coils.in }}</td><td>{{ row.coils.out }}</td><td>{{ row.kg_per_coil if row.kg_per_coil else '-' }}</td>{% else %}<td>-</td><td>-</td><td>-</td><td>-</td>{% endif %}</tr>{% endfor %}
     </table></div>
   </div>
   <div id="table-consumables" class="cat-block" style="display:none;">
     <div class="cat-total-row"><span>Total Consumables Balance</span><span class="cat-total-value">{{ totals.consumables }}</span></div>
-    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th><th>Count</th></tr>
-    {% for row in consumables_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Consumables" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td><td>{% if row.coils %}<b>{{ row.coils.balance }}</b> <small>{{ row.coil_unit }} (+{{ row.coils.in }}/&minus;{{ row.coils.out }}){% if row.kg_per_coil %}<br>{{ row.kg_per_coil }} kg each{% endif %}</small>{% else %}<span style="color:var(--ink-soft);">-</span>{% endif %}</td></tr>{% endfor %}
+    <div class="table-wrap"><table><tr><th>Item</th><th>Opening</th><th>Received</th><th>Consumed</th><th>Balance</th><th>Count Balance</th><th>Count In</th><th>Count Out</th><th>Kg per Count</th></tr>
+    {% for row in consumables_stock %}<tr><td><a href="/item-detail?item={{ row.item|urlencode }}&category=Consumables" style="color:var(--ink);font-weight:600;">{{ row.item }}</a></td><td>{{ row.opening }}</td><td>{{ row.in }}</td><td>{{ row.out }}</td><td class="{{ 'badge-bad' if row.balance <= 0 else 'badge-ok' }}">{{ row.balance }}</td>{% if row.coils %}<td><b>{{ row.coils.balance }}</b> {{ row.coil_unit|capitalize }}</td><td>{{ row.coils.in }}</td><td>{{ row.coils.out }}</td><td>{{ row.kg_per_coil if row.kg_per_coil else '-' }}</td>{% else %}<td>-</td><td>-</td><td>-</td><td>-</td>{% endif %}</tr>{% endfor %}
     </table></div>
   </div>
 
@@ -4614,9 +4615,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <form method="POST" action="/bulk-delete-line-items" onsubmit="return confirm('Delete all selected entries? This cannot be undone.');">
       <input type="hidden" name="key" value="{{ admin_key }}">
       <table>
-        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
+        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th><th>Edit</th></tr>
         {% for r in production_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4624,8 +4625,8 @@ DASHBOARD_HTML = BASE_STYLE + """
     </form>
     {% else %}
       <table>
-        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+        {% for r in production_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4638,9 +4639,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <form method="POST" action="/bulk-delete-line-items" onsubmit="return confirm('Delete all selected entries? This cannot be undone.');">
       <input type="hidden" name="key" value="{{ admin_key }}">
       <table>
-        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
+        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th><th>Edit</th></tr>
         {% for r in consumption_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4648,8 +4649,8 @@ DASHBOARD_HTML = BASE_STYLE + """
     </form>
     {% else %}
       <table>
-        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+        {% for r in consumption_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4662,9 +4663,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <form method="POST" action="/bulk-delete-line-items" onsubmit="return confirm('Delete all selected entries? This cannot be undone.');">
       <input type="hidden" name="key" value="{{ admin_key }}">
       <table>
-        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th><th>Edit</th></tr>
+        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th><th>Count</th><th>Edit</th></tr>
         {% for r in electricity_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4672,8 +4673,8 @@ DASHBOARD_HTML = BASE_STYLE + """
     </form>
     {% else %}
       <table>
-        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th></tr>
-        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Electricity Units</th><th>Type</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+        {% for r in electricity_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[10] }}</td><td>{{ 'Wire Rod Issued' if r[4] == 'wire_rod' else 'MS Wire Issued' }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4686,9 +4687,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <form method="POST" action="/bulk-delete-line-items" onsubmit="return confirm('Delete all selected entries? This cannot be undone.');">
       <input type="hidden" name="key" value="{{ admin_key }}">
       <table>
-        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th><th>Edit</th></tr>
+        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Count</th><th>Rate</th><th>Value</th><th>Edit</th></tr>
         {% for r in receipts_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4696,8 +4697,8 @@ DASHBOARD_HTML = BASE_STYLE + """
     </form>
     {% else %}
       <table>
-        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Rate</th><th>Value</th></tr>
-        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
+        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Category</th><th>Item</th><th>Qty</th><th>Count</th><th>Rate</th><th>Value</th></tr>
+        {% for r in receipts_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ {'receipt_consumables':'Consumables','receipt_raw_material':'Raw Material','receipt_semi_finished':'Semi-Finished','receipt_finished_goods':'Finished Goods'}.get(r[4], r[4]) }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td><td>{{ r[7] if r[7] is not none else '' }}</td><td>{{ r[8] if r[8] is not none else '' }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -4711,9 +4712,9 @@ DASHBOARD_HTML = BASE_STYLE + """
     <form method="POST" action="/bulk-delete-line-items" onsubmit="return confirm('Delete all selected entries? This cannot be undone.');">
       <input type="hidden" name="key" value="{{ admin_key }}">
       <table>
-        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th><th>Edit</th></tr>
+        <tr><th><input type="checkbox" onclick="this.closest('table').querySelectorAll('.li-chk').forEach(function(c){c.checked=this.checked;}.bind(this))"></th><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th><th>Price</th><th>Total</th><th>Customer</th><th>Edit</th></tr>
         {% for r in sales_rows %}
-        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
+        <tr><td><input type="checkbox" class="li-chk" name="delete_ids[]" value="{{ r[0] }}"></td><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td>
         <td><a href="/edit-entry?table=line_items&id={{ r[0] }}&key={{ admin_key }}">Edit</a></td></tr>
         {% endfor %}
       </table>
@@ -4721,8 +4722,8 @@ DASHBOARD_HTML = BASE_STYLE + """
     </form>
     {% else %}
       <table>
-        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Price</th><th>Total</th><th>Customer</th></tr>
-        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
+        <tr><th>Date</th><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th><th>Price</th><th>Total</th><th>Customer</th></tr>
+        {% for r in sales_rows %}<tr><td>{{ r[1] }}</td><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td><td>{{ r[7] }}</td><td>{{ r[8] }}</td><td>{{ r[9] }}</td></tr>{% endfor %}
       </table>
     {% endif %}
     </div>
@@ -5077,7 +5078,7 @@ EDIT_FORM_HTML = BASE_STYLE + """
       })();
     </script>
     {% else %}
-    <label>{{ col_name }}{{ ' *' if col_name in protected_columns else '' }}</label>
+    <label>{{ labels.get(col_name, col_name) }}{{ ' *' if col_name in protected_columns else '' }}</label>
     <input type="text" name="col_{{ col_name }}" value="{{ value if value is not none else '' }}" {{ 'required' if col_name in protected_columns else '' }}>
     {% endif %}
     {% endfor %}
@@ -5098,7 +5099,7 @@ DELETE_CONFIRM_HTML = BASE_STYLE + """
   <div style="background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:14px 16px;margin:16px 0;">
     {% for col_name, value in fields %}
     <div style="display:flex;justify-content:space-between;padding:4px 0;font-size:14px;">
-      <span style="color:var(--ink-soft);">{{ col_name }}</span><b>{{ value if value is not none else '' }}</b>
+      <span style="color:var(--ink-soft);">{{ labels.get(col_name, col_name) }}</span><b>{{ value if value is not none else '' }}</b>
     </div>
     {% endfor %}
   </div>
@@ -5122,6 +5123,23 @@ NOT_NULL_COLUMNS = {
     "readings": {"entry_date", "entry_time", "operator"},
 }
 NOT_NULL_SUBMISSION_COLUMNS = {"entry_date", "entry_time", "operator"}
+
+
+FIELD_LABELS = {
+    "entry_date": "Date", "entry_time": "Time", "operator": "Operator", "electricity_units": "Electricity Units",
+    "item_name": "Item", "quantity": "Quantity", "price": "Rate (Rs.)", "total_amount": "Total Amount (Rs.)",
+    "t1": "T1", "t2": "T2", "t3": "T3", "b1": "B1", "b1_hours": "B1 Hours", "b2": "B2", "b2_hours": "B2 Hours",
+    "alerts": "Alerts",
+}
+
+
+def field_labels(fields):
+    """Friendly labels for the Edit / Delete pages. The count field is named by its
+    unit (Coils / Ingots / Boxes / Bags) from the item on that row."""
+    labels = dict(FIELD_LABELS)
+    item = next((v for c, v in fields if c == "item_name"), None)
+    labels["coils"] = "No. of " + (consumable_count_unit(item) if item and consumable_count_unit(item) else "Coils")
+    return labels
 
 
 @app.route("/edit-entry", methods=["GET"])
@@ -5176,7 +5194,7 @@ def edit_entry():
                            "cur_size": rm_base(cur_item), "cur_make": rm_make_of(cur_item)}
 
     return render_template_string(EDIT_FORM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key(),
-                                   protected_columns=protected, rm_edit=rm_edit)
+                                   protected_columns=protected, rm_edit=rm_edit, labels=field_labels(fields))
 
 
 @app.route("/save-edit", methods=["POST"])
@@ -5291,7 +5309,7 @@ def delete_entry_confirm():
         abort(404)
 
     fields = list(zip(columns, row))
-    return render_template_string(DELETE_CONFIRM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key())
+    return render_template_string(DELETE_CONFIRM_HTML, table=table, row_id=row_id, fields=fields, admin_key=active_key(), labels=field_labels(fields))
 
 
 @app.route("/confirm-delete", methods=["POST"])
@@ -6203,8 +6221,8 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   {% if not section or section == 'production' %}
   <h2 class="section">Production</h2>
   <div class="table-wrap"><table>
-    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+    {% for r in production_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
     {% if not production_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -6212,8 +6230,8 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   {% if not section or section == 'consumption' %}
   <h2 class="section">Consumption</h2>
   <div class="table-wrap"><table>
-    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+    {% for r in consumption_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
     {% if not consumption_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -6221,8 +6239,8 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   {% if not section or section == 'electricity' %}
   <h2 class="section">Electricity &amp; Wire Rod</h2>
   <div class="table-wrap"><table>
-    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+    {% for r in electricity_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
     {% if not electricity_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -6230,8 +6248,8 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   {% if not section or section == 'receipts' %}
   <h2 class="section">Receipts</h2>
   <div class="table-wrap"><table>
-    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th></tr>
-    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td></tr>{% endfor %}
+    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th></tr>
+    {% for r in receipts_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td></tr>{% endfor %}
     {% if not receipts_rows %}<tr><td colspan="4" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -6239,8 +6257,8 @@ DAY_DETAIL_HTML = BASE_STYLE + """
   {% if show_sales and (not section or section == 'sales') %}
   <h2 class="section">Sales</h2>
   <div class="table-wrap"><table>
-    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Revenue</th></tr>
-    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}{% if r[12] is not none %} <small>({{ r[12] }}{{ ' ' ~ unit_of(r[5]) }})</small>{% endif %}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
+    <tr><th>Time</th><th>Operator</th><th>Item</th><th>Qty</th><th>Count</th><th>Revenue</th></tr>
+    {% for r in sales_rows %}<tr><td>{{ r[2] }}</td><td>{{ r[3] }}</td><td>{{ r[5] }}</td><td>{{ r[6] }}</td><td>{% if r[12] is not none %}{{ r[12] }} {{ unit_of(r[5])|capitalize }}{% else %}-{% endif %}</td><td>{{ r[8] if r[8] is not none else '-' }}</td></tr>{% endfor %}
     {% if not sales_rows %}<tr><td colspan="5" style="text-align:center;color:var(--ink-soft);">None logged</td></tr>{% endif %}
   </table></div>
   {% endif %}
@@ -7863,7 +7881,7 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
   {% for h in history %}
   <div style="border:1px solid var(--line);border-radius:8px;padding:10px 14px;margin-bottom:8px;">
     <div style="font-size:13px;color:var(--ink-soft);">{{ h.date }} {{ h.time }} &mdash; {{ h.operator }} &mdash; from <b>{{ h.source }}</b></div>
-    {% for t in h.targets %}<div style="font-size:14px;">{{ t.item }}: <b>{{ t.qty }} kg</b>{% if t.coils is not none %} ({{ t.coils }} {{ 'coils' }}){% endif %}</div>{% endfor %}
+    {% for t in h.targets %}<div style="font-size:14px;">{{ t.item }}: <b>{{ t.qty }} kg</b>{% if t.coils is not none %} &nbsp;|&nbsp; <b>{{ t.coils }}</b> Coils{% endif %}</div>{% endfor %}
     <a href="/delete-submission?batch_id={{ h.batch_id }}&key={{ admin_key }}&back=move" style="color:var(--bad);font-size:13px;font-weight:700;">Undo this move</a>
   </div>
   {% endfor %}
