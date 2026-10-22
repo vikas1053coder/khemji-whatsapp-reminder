@@ -1047,7 +1047,8 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
     category_map = {
         "Consumables": [("receipt_consumables", "Received"), ("consumption", "Consumed"), ("sale", "Sold")],
         "Raw Material": [("receipt_raw_material", "Received"), ("rm_transfer_in", "Moved in"), ("wire_rod", "Issued"),
-                        ("rm_transfer_out", "Moved out"), ("sale", "Sold")],
+                        ("rm_transfer_out", "Moved out"), ("sale", "Sold"),
+                        ("rm_count_in", "Count correction (+)"), ("rm_count_out", "Count correction (-)")],
         "Semi-Finished": [("ms_wire_produced", "Produced"), ("scrap_produced", "Produced"),
                           ("receipt_semi_finished", "Received"), ("ms_wire_consumed", "Issued"), ("sale", "Sold")],
         "Finished Goods": [("production", "Produced"), ("receipt_finished_goods", "Received"), ("sale", "Sold")],
@@ -1063,7 +1064,7 @@ def get_item_transaction_history(category_label, item_name, from_date, to_date):
             ORDER BY s.entry_date, s.entry_time
         """, (category_db, item_name, from_date, to_date))
         for entry_date, entry_time, operator, qty, coils in cur.fetchall():
-            direction = "in" if label in ("Received", "Produced", "Moved in") else "out"
+            direction = "in" if label in ("Received", "Produced", "Moved in", "Count correction (+)") else "out"
             rows.append({"entry_date": entry_date, "entry_time": entry_time, "operator": operator,
                         "action": label, "quantity": float(qty), "direction": direction,
                         "coils": int(coils) if coils is not None else None})
@@ -1676,8 +1677,8 @@ def get_coil_opening_map():
     return result
 
 
-COIL_IN_CATEGORIES = ("receipt_raw_material", "production", "receipt_finished_goods", "receipt_consumables", "rm_transfer_in")
-COIL_OUT_CATEGORIES = ("wire_rod", "sale", "consumption", "rm_transfer_out")
+COIL_IN_CATEGORIES = ("receipt_raw_material", "production", "receipt_finished_goods", "receipt_consumables", "rm_transfer_in", "rm_count_in")
+COIL_OUT_CATEGORIES = ("wire_rod", "sale", "consumption", "rm_transfer_out", "rm_count_out")
 
 
 @request_cache
@@ -7876,6 +7877,31 @@ MOVE_OLD_STOCK_HTML = BASE_STYLE + """
   </form>
   {% endif %}
 
+  {% if fixes %}
+  <h2 class="section" style="margin-top:28px;">Fix count mismatches</h2>
+  <p class="subtitle">These lines have <b>0 kg</b> of stock but still show a count. With no stock the count must be 0. This saves a correction entry (0 kg, so cost and P&amp;L are not affected) and you can undo it below.</p>
+  <form method="POST" action="/fix-counts" onsubmit="return confirm('Set the count of the ticked lines to 0?');">
+    <input type="hidden" name="key" value="{{ admin_key }}">
+    <div class="table-wrap"><table>
+      <tr><th></th><th>Item</th><th>Stock</th><th>Count now</th><th>After fix</th></tr>
+      {% for f in fixes %}
+      <tr><td><input type="checkbox" name="item[]" value="{{ f.item }}" checked></td><td>{{ f.item }}</td><td>0 kg</td><td>{{ f.coils }} Coils</td><td>0 Coils</td></tr>
+      {% endfor %}
+    </table></div>
+    <button class="submit" type="submit">Set ticked counts to 0</button>
+  </form>
+  {% endif %}
+  {% if fix_history %}
+  <h2 class="section" style="margin-top:28px;">Count corrections</h2>
+  {% for h in fix_history %}
+  <div style="border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-bottom:8px;">
+    <div style="font-size:13px;color:var(--ink-soft);">{{ h.date }} {{ h.time }} &middot; {{ h.operator }}</div>
+    {% for t in h.lines %}<div style="font-size:14px;">{{ t.item }}: <b>{{ '+' if t.delta > 0 else '' }}{{ t.delta }}</b> Coils</div>{% endfor %}
+    <a href="/delete-submission?batch_id={{ h.batch_id }}&key={{ admin_key }}&back=move" style="color:var(--bad);font-size:13px;font-weight:700;">Undo this correction</a>
+  </div>
+  {% endfor %}
+  {% endif %}
+
   <h2 class="section" style="margin-top:28px;">Earlier moves</h2>
   {% if not history %}<p style="color:var(--ink-soft);font-size:14px;">No moves yet.</p>{% endif %}
   {% for h in history %}
@@ -7986,7 +8012,8 @@ def move_old_stock():
 
     return render_template_string(MOVE_OLD_STOCK_HTML, admin_key=active_key(), legacy=legacy, makes=get_rm_makes(),
                                    default_time=default_entry_time(), history=history, saved=bool(request.args.get("saved")),
-                                   settle=([] if is_manager() else settle_candidates(today)))
+                                   settle=([] if is_manager() else settle_candidates(today)),
+                                   fixes=([] if is_manager() else count_fix_candidates(today)), fix_history=([] if is_manager() else count_fix_history()))
 
 
 def settle_candidates(today):
@@ -8005,6 +8032,64 @@ def settle_candidates(today):
         out.append({"size": r["item"], "balance": round(r["balance"], 2), "opening": round(r["opening"], 2),
                     "new_opening": round(r["opening"] - r["balance"], 2), "coils": cb})
     return out
+
+
+def count_fix_candidates(today):
+    """Raw material lines (with a make) that have no kg left but still show a count."""
+    coil_map = compute_coil_balances(today)
+    out = []
+    for r in compute_stock(today)[1]:
+        if "|" not in r["item"] or abs(r["balance"]) >= 0.005:
+            continue
+        c = coil_map.get(r["item"])
+        if c and c["balance"] != 0:
+            out.append({"item": r["item"], "coils": c["balance"]})
+    return out
+
+
+def count_fix_history():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.batch_id, s.entry_date, s.entry_time, s.operator, li.category, li.item_name, li.coils
+        FROM submissions s JOIN line_items li ON li.batch_id = s.batch_id
+        WHERE s.form_type='count_fix' ORDER BY s.entry_date DESC, s.entry_time DESC, li.id
+    """)
+    batches, order = {}, []
+    for batch_id, d, t, op, cat, item, coils in cur.fetchall():
+        k = str(batch_id)
+        if k not in batches:
+            batches[k] = {"batch_id": k, "date": str(d), "time": str(t)[:5], "operator": op, "lines": []}
+            order.append(k)
+        delta = int(coils or 0) * (1 if cat == "rm_count_in" else -1)
+        batches[k]["lines"].append({"item": item, "delta": delta})
+    cur.close()
+    return [batches[k] for k in order[:10]]
+
+
+@app.route("/fix-counts", methods=["POST"])
+def fix_counts():
+    if not key_ok(request.form.get("key")):
+        abort(403)
+    today = now_ist().strftime("%Y-%m-%d")
+    chosen = set(request.form.getlist("item[]"))
+    cands = [c for c in count_fix_candidates(today) if c["item"] in chosen]
+    if not cands:
+        return redirect(f"/move-old-stock?key={active_key()}&saved=1")
+    batch_id = str(uuid.uuid4())
+    operator = "Manager" if is_manager() else "Admin"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO submissions (batch_id, form_type, entry_date, entry_time, operator) VALUES (%s,%s,%s,%s,%s)",
+                (batch_id, "count_fix", today, now_ist().strftime("%H:%M:%S"), operator))
+    for c in cands:
+        bal = c["coils"]
+        cat = "rm_count_out" if bal > 0 else "rm_count_in"
+        cur.execute("INSERT INTO line_items (batch_id, category, item_name, quantity, coils) VALUES (%s,%s,%s,%s,%s)",
+                    (batch_id, cat, c["item"], 0, abs(bal)))
+    conn.commit()
+    cur.close()
+    return redirect(f"/move-old-stock?key={active_key()}&saved=1")
 
 
 @app.route("/settle-old-stock", methods=["POST"])
