@@ -129,7 +129,8 @@ SEED_ITEMS = {
 
 SEED_MACHINES = ["Furnace", "Wire Drawing Machine 1", "Wire Drawing Machine 2", "Galvanizing Line", "Coiling Machine"]
 SEED_SPARES = ["Bearing 6205", "V-Belt A47", "Motor 5HP", "Contactor 32A"]
-EXPENSE_CATEGORIES = ["Office", "Petty Cash", "Travel", "Other"]
+EXPENSE_CATEGORIES = ["Consumables", "Office", "Petty Cash", "Travel", "Other"]
+EXPENSE_CONSUMABLE_SEED = ["Acid", "Wire Drawing Powder", "Dies"]
 DOCUMENT_CATEGORIES = ["Licenses & Registrations", "ISO & Quality Certificates", "Compliance & Environment", "Land & Property", "Other"]
 
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "your_google_sheet_id_here")
@@ -407,6 +408,7 @@ def init_db():
         cur.execute("ALTER TABLE preventive_maintenance_schedule ADD COLUMN IF NOT EXISTS last_cost NUMERIC")
         cur.execute("ALTER TABLE opening_stock ADD COLUMN IF NOT EXISTS opening_value NUMERIC")
         cur.execute("ALTER TABLE line_items ADD COLUMN IF NOT EXISTS coils INTEGER")
+        cur.execute("ALTER TABLE general_expenses ADD COLUMN IF NOT EXISTS item TEXT NOT NULL DEFAULT ''")
         cur.execute("ALTER TABLE pnl_opening_bootstrap ADD COLUMN IF NOT EXISTS for_month TEXT")
         cur.execute("ALTER TABLE documents ADD COLUMN IF NOT EXISTS authority TEXT")
 
@@ -756,6 +758,26 @@ def get_known_spares():
     spares |= set(r[0] for r in cur.fetchall())
     cur.close()
     return sorted(spares)
+
+
+def get_expense_consumable_items():
+    """Consumables bought as expenses (not stock-tracked): seed list + anything added before."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT item FROM general_expenses WHERE category='Consumables' AND item <> ''")
+    known = {r[0] for r in cur.fetchall()}
+    cur.close()
+    return sorted(set(EXPENSE_CONSUMABLE_SEED) | known)
+
+
+def expense_item_from_form(form):
+    """Item name for a Consumables expense (dropdown, or typed when 'Other' is chosen); '' for other categories."""
+    if form.get("category") != "Consumables":
+        return ""
+    item = form.get("item", "")
+    if item == "__other__":
+        item = form.get("custom_item", "")
+    return " ".join(item.split())
 
 
 def sum_general_expenses_for_month(month_str):
@@ -1362,8 +1384,8 @@ def compute_pnl(month_str, manual_opening_fg_value=None):
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT entry_date, category, description, amount FROM general_expenses WHERE TO_CHAR(entry_date,'YYYY-MM')=%s ORDER BY entry_date", (month_str,))
-    general_expense_rows = [{"entry_date": r[0], "category": r[1], "description": r[2], "amount": float(r[3])} for r in cur.fetchall()]
+    cur.execute("SELECT entry_date, category, description, amount, item FROM general_expenses WHERE TO_CHAR(entry_date,'YYYY-MM')=%s ORDER BY entry_date", (month_str,))
+    general_expense_rows = [{"entry_date": r[0], "category": r[1] + (" - " + r[4] if r[4] else ""), "description": r[2], "amount": float(r[3])} for r in cur.fetchall()]
     cur.execute("SELECT entry_date, machine, description, amount FROM maintenance_expenses WHERE TO_CHAR(entry_date,'YYYY-MM')=%s ORDER BY entry_date", (month_str,))
     maintenance_expense_rows = [{"entry_date": r[0], "machine": r[1], "description": r[2], "amount": float(r[3])} for r in cur.fetchall()]
     cur.execute("SELECT reported_date, machine, issue_description, repair_cost FROM breakdown_maintenance WHERE TO_CHAR(reported_date,'YYYY-MM')=%s AND repair_cost IS NOT NULL ORDER BY reported_date", (month_str,))
@@ -5962,7 +5984,7 @@ GENERAL_EXPENSE_HTML = BASE_STYLE + """
     {% else %}<a href="/app-home">&larr; Back to Home</a>{% endif %}
   </div>
   <h1>Log Expense</h1>
-  <p class="subtitle">Office, petty cash, and other indirect expenses - feeds automatically into P&amp;L "Other Costs"</p>
+  <p class="subtitle">Consumables (acid, powder, dies...), office, petty cash and other expenses - feeds automatically into P&amp;L "Other Costs"</p>
 
   <form id="expenseForm" method="POST" action="/submit-general-expense">
     <input type="hidden" name="key" value="{{ admin_key }}">
@@ -5971,11 +5993,43 @@ GENERAL_EXPENSE_HTML = BASE_STYLE + """
     <label>Date</label>
     <input type="date" name="entry_date" value="{{ today }}" required>
     <label>Category</label>
-    <select name="category">
-      {% for c in categories %}<option value="{{ c }}">{{ c }}</option>{% endfor %}
+    <select name="category" id="expCat" onchange="expCatChanged()">
+      {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == cur_cat else '' }}>{{ c }}</option>{% endfor %}
     </select>
-    <label>Description</label>
-    <input type="text" name="description" required>
+    <div id="expItemBox" style="display:none;">
+      <label>Consumable Item</label>
+      <select name="item" id="expItem" onchange="expItemChanged()">
+        {% for i in consumable_items %}<option value="{{ i }}" {{ 'selected' if i == cur_item else '' }}>{{ i }}</option>{% endfor %}
+        <option value="__other__">+ Add another item</option>
+      </select>
+      <input type="text" name="custom_item" id="expCustomItem" placeholder="New consumable item name" style="display:none;" oninput="expCustomTyped()">
+    </div>
+    <label>Description <span id="expDescOpt" style="font-weight:400;color:var(--ink-soft);"></span></label>
+    <input type="text" name="description" id="expDesc" value="{{ cur_desc }}">
+    <script>
+    function expCatChanged() {
+      var isCons = document.getElementById('expCat').value === 'Consumables';
+      document.getElementById('expItemBox').style.display = isCons ? 'block' : 'none';
+      var it = document.getElementById('expItem');
+      if (!isCons) { it.selectedIndex = -1; it.value = ''; document.getElementById('expCustomItem').value = ''; }
+      else if (it.selectedIndex < 0 || !it.value) { it.selectedIndex = 0; }
+      expItemChanged();
+      document.getElementById('expDesc').required = !isCons;
+      document.getElementById('expDescOpt').textContent = isCons ? '(optional)' : '';
+    }
+    function expItemChanged() {
+      var it = document.getElementById('expItem'), c = document.getElementById('expCustomItem');
+      var other = it.selectedIndex === it.options.length - 1;
+      c.style.display = other ? 'block' : 'none'; c.required = other;
+      if (!other) c.value = '';
+    }
+    function expCustomTyped() {
+      // keep the dropdown's value equal to the typed name so the review screen shows it
+      var it = document.getElementById('expItem'), v = document.getElementById('expCustomItem').value.trim();
+      it.options[it.options.length - 1].value = v || '__other__';
+    }
+    expCatChanged();
+    </script>
     <label>Amount (Rs.)</label>
     <input type="number" step="any" name="amount" required>
     <button class="submit review-btn" type="button">Review Entry</button>
@@ -6000,7 +6054,7 @@ GENERAL_EXPENSE_HTML = BASE_STYLE + """
   <div class="table-wrap"><table>
     <tr><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th>Action</th></tr>
     {% for e in expenses %}
-    <tr><td>{{ e.entry_date }}</td><td>{{ e.category }}</td><td>{{ e.description }}</td><td>Rs. {{ e.amount }}</td>
+    <tr><td>{{ e.entry_date }}</td><td>{{ e.category }}{% if e.item %} &ndash; {{ e.item }}{% endif %}</td><td>{{ e.description }}</td><td>Rs. {{ e.amount }}</td>
     <td><a href="/edit-general-expense?id={{ e.id }}&operator={{ operator }}&month={{ view_month }}{{ '&key=' + admin_key if came_from_admin else '' }}">Edit</a> | <a href="/delete-general-expense?id={{ e.id }}&operator={{ operator }}&month={{ view_month }}{{ '&key=' + admin_key if came_from_admin else '' }}" style="color:var(--bad);" onclick="return confirm('Delete this expense?');">Delete</a></td></tr>
     {% endfor %}
     <tr style="font-weight:700;"><td colspan="3">Total</td><td>Rs. {{ month_total }}</td><td></td></tr>
@@ -6019,11 +6073,43 @@ EDIT_GENERAL_EXPENSE_HTML = BASE_STYLE + """
     <label>Date</label>
     <input type="date" name="entry_date" value="{{ e.entry_date }}" required>
     <label>Category</label>
-    <select name="category">
-      {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == e.category else '' }}>{{ c }}</option>{% endfor %}
+    <select name="category" id="expCat" onchange="expCatChanged()">
+      {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == cur_cat else '' }}>{{ c }}</option>{% endfor %}
     </select>
-    <label>Description</label>
-    <input type="text" name="description" value="{{ e.description }}" required>
+    <div id="expItemBox" style="display:none;">
+      <label>Consumable Item</label>
+      <select name="item" id="expItem" onchange="expItemChanged()">
+        {% for i in consumable_items %}<option value="{{ i }}" {{ 'selected' if i == cur_item else '' }}>{{ i }}</option>{% endfor %}
+        <option value="__other__">+ Add another item</option>
+      </select>
+      <input type="text" name="custom_item" id="expCustomItem" placeholder="New consumable item name" style="display:none;" oninput="expCustomTyped()">
+    </div>
+    <label>Description <span id="expDescOpt" style="font-weight:400;color:var(--ink-soft);"></span></label>
+    <input type="text" name="description" id="expDesc" value="{{ cur_desc }}">
+    <script>
+    function expCatChanged() {
+      var isCons = document.getElementById('expCat').value === 'Consumables';
+      document.getElementById('expItemBox').style.display = isCons ? 'block' : 'none';
+      var it = document.getElementById('expItem');
+      if (!isCons) { it.selectedIndex = -1; it.value = ''; document.getElementById('expCustomItem').value = ''; }
+      else if (it.selectedIndex < 0 || !it.value) { it.selectedIndex = 0; }
+      expItemChanged();
+      document.getElementById('expDesc').required = !isCons;
+      document.getElementById('expDescOpt').textContent = isCons ? '(optional)' : '';
+    }
+    function expItemChanged() {
+      var it = document.getElementById('expItem'), c = document.getElementById('expCustomItem');
+      var other = it.selectedIndex === it.options.length - 1;
+      c.style.display = other ? 'block' : 'none'; c.required = other;
+      if (!other) c.value = '';
+    }
+    function expCustomTyped() {
+      // keep the dropdown's value equal to the typed name so the review screen shows it
+      var it = document.getElementById('expItem'), v = document.getElementById('expCustomItem').value.trim();
+      it.options[it.options.length - 1].value = v || '__other__';
+    }
+    expCatChanged();
+    </script>
     <label>Amount (Rs.)</label>
     <input type="number" step="any" name="amount" value="{{ e.amount }}" required>
     <button class="submit" type="submit">Save Changes</button>
@@ -6040,14 +6126,14 @@ def log_expense_form():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, entry_date, category, description, amount FROM general_expenses
+        SELECT id, entry_date, category, description, amount, item FROM general_expenses
         WHERE TO_CHAR(entry_date,'YYYY-MM')=%s ORDER BY entry_date DESC
     """, (month_str,))
-    expenses = [{"id": r[0], "entry_date": r[1], "category": r[2], "description": r[3], "amount": float(r[4])} for r in cur.fetchall()]
+    expenses = [{"id": r[0], "entry_date": r[1], "category": r[2], "description": r[3], "amount": float(r[4]), "item": r[5]} for r in cur.fetchall()]
     cur.close()
     month_total = round(sum(e["amount"] for e in expenses), 2)
 
-    return render_template_string(GENERAL_EXPENSE_HTML, admin_key=active_key(), operator=operator, today=now_ist().strftime("%Y-%m-%d"),
+    return render_template_string(GENERAL_EXPENSE_HTML, cur_cat="Consumables", cur_item="", cur_desc="", consumable_items=get_expense_consumable_items(), admin_key=active_key(), operator=operator, today=now_ist().strftime("%Y-%m-%d"),
                                    categories=EXPENSE_CATEGORIES, expenses=expenses, month_total=month_total,
                                    view_month=month_str, came_from_admin=came_from_admin)
 
@@ -6058,10 +6144,11 @@ def submit_general_expense():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO general_expenses (entry_date, category, description, amount, operator)
-        VALUES (%s,%s,%s,%s,%s)
+        INSERT INTO general_expenses (entry_date, category, description, amount, operator, item)
+        VALUES (%s,%s,%s,%s,%s,%s)
     """, (request.form.get("entry_date", ""), request.form.get("category", "Other"),
-          request.form.get("description", ""), safe_float(request.form.get("amount", "0")), operator))
+          request.form.get("description", ""), safe_float(request.form.get("amount", "0")), operator,
+          expense_item_from_form(request.form)))
     conn.commit()
     cur.close()
 
@@ -6077,13 +6164,17 @@ def edit_general_expense():
     key_param = request.args.get("key", "") if key_ok(request.args.get("key")) else ""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("SELECT id, entry_date, category, description, amount FROM general_expenses WHERE id=%s", (expense_id,))
+    cur.execute("SELECT id, entry_date, category, description, amount, item FROM general_expenses WHERE id=%s", (expense_id,))
     row = cur.fetchone()
     cur.close()
     if not row:
         abort(404)
-    e = {"id": row[0], "entry_date": row[1], "category": row[2], "description": row[3], "amount": row[4]}
-    return render_template_string(EDIT_GENERAL_EXPENSE_HTML, e=e, operator=operator, categories=EXPENSE_CATEGORIES, key_param=key_param)
+    e = {"id": row[0], "entry_date": row[1], "category": row[2], "description": row[3], "amount": row[4], "item": row[5]}
+    items = get_expense_consumable_items()
+    if e["item"] and e["item"] not in items:
+        items.append(e["item"])
+    return render_template_string(EDIT_GENERAL_EXPENSE_HTML, e=e, operator=operator, categories=EXPENSE_CATEGORIES, key_param=key_param,
+                                   cur_cat=e["category"], cur_item=e["item"], cur_desc=e["description"], consumable_items=items)
 
 
 @app.route("/save-general-expense", methods=["POST"])
@@ -6094,9 +6185,9 @@ def save_general_expense():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE general_expenses SET entry_date=%s, category=%s, description=%s, amount=%s WHERE id=%s
+        UPDATE general_expenses SET entry_date=%s, category=%s, description=%s, amount=%s, item=%s WHERE id=%s
     """, (request.form.get("entry_date", ""), request.form.get("category", "Other"),
-          request.form.get("description", ""), safe_float(request.form.get("amount", "0")), expense_id))
+          request.form.get("description", ""), safe_float(request.form.get("amount", "0")), expense_item_from_form(request.form), expense_id))
     conn.commit()
     cur.close()
     new_month = request.form.get("entry_date", "")[:7]
